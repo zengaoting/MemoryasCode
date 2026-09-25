@@ -1,0 +1,8 @@
+openai
+httpx
+pydantic
+python-dotenv
+tqdm
+nltk
+regex
+sentence-transformers
