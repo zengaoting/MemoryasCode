@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import math
 import os
 import re
 import time
@@ -26,11 +27,12 @@ from .program_executor import (
     render_evidence_context,
 )
 from .utils import read_json, write_json
+from .prompt_contracts import QUERY_POLICY_VERSION, QUERY_PLANNING_SYSTEM, QUERY_PLANNING_USER
 
 logger = logging.getLogger(__name__)
 
 STAGE_CHECKPOINT_SCHEMA = "question_stage_checkpoint_v1"
-STAGE_CHECKPOINT_VERSION = 29
+STAGE_CHECKPOINT_VERSION = 32
 QUESTION_STAGE_NAMES = (
     "candidate_retrieval",
     "program_execution",
@@ -80,6 +82,8 @@ This benchmark question is answerable from the retrieved facts. Return mode "ans
 the same JSON schema with a concrete non-empty answer, a supports list containing only
 visible dialogue ids, and confidence. Do not return navigate mode, an empty answer, or a
 missing-answer object.
+Return a JSON object, not a list or null. answer must be a non-empty string;
+supports must be a list of strings and confidence must be a number between 0 and 1.
 """.strip()
 MULTI_HOP_EXHAUSTIVE_SYSTEM = """
 You audit exhaustive multi-hop answers against long-term dialogue evidence. Build an
@@ -199,111 +203,12 @@ OPEN_DOMAIN_ALTERNATIVE_PATTERN = re.compile(r"\bor\b", re.I)
 OPEN_DOMAIN_EXPLICIT_BINARY_PATTERN = re.compile(r"\byes\s+or\s+no\b", re.I)
 
 
-def _category_id(value):
-    """Return a normalized category identifier for either benchmark."""
-    return str(value or "").strip().lower()
-
-
-def _locomo_category(value) -> int | None:
-    """Return LoCoMo's numeric category when ``value`` is one of its labels."""
-    normalized = _category_id(value)
-    if normalized in {"1", "2", "3", "4", "5"}:
-        return int(normalized)
-    return None
-
-
-def format_final_question_for_mragent(question: str, category) -> str:
-    """Add the preserved benchmark-specific answer instructions."""
-    locomo_category = _locomo_category(category)
-    if locomo_category == 1:
-        return (
-            question
-            + " Resolve every requested relation jointly and return all and only the requested items. "
-            + "Before answering, build an internal list of qualifying evidence by dialogue id. For count "
-            + "questions, count distinct real events: merge repeated descriptions of one event, include "
-            + "result statements such as an explicitly won trophy when they satisfy the event, and exclude "
-            + "plans, goals, feelings, advice, implied-but-unstated outcomes, and topic-neighbor facts. Merge "
-            + "later comments about the same trophy or victory into that earlier event. For two-person questions, evaluate "
-            + "each person before taking the requested union or intersection. Output no explanation."
-        )
-    if locomo_category == 2:
-        return (
-            question
-            + " First identify the exact event using all person, object, place, relation, and date "
-            + "constraints; retrieval rank is not authority and a similar event must not be substituted. "
-            + "Resolve an exact relative date only when the original wording supports that precision; "
-            + "'yesterday' of conversation time '7 May 2023' is '6 May 2023'. "
-            + "Original dialogue wording outranks normalized_time when the latter invents finer precision. "
-            + "Intersect multiple source constraints on the same event rather than choosing only one; a "
-            + "month-level plan plus 'last week' in an early-month report can establish early month. "
-            + "A follow-up report may omit the location from an earlier plan; link them when person, event "
-            + "type, and timeline identify the same unique event. "
-            + "For 'when did X start' questions, convert an explicit elapsed duration into an absolute "
-            + "month/year using session_datetime; do not answer only 'N months ago'. For 'after how many "
-            + "weeks did X reconnect', compare the two reporting-session dates in whole weeks and do not "
-            + "backshift the first report a second time because it says 'last week'. Use the deterministic "
-            + "elapsed-week calculation in the evidence when present. "
-            + "For 'where during a period', use only location-bearing travel/stay evidence that overlaps "
-            + "the period; an unrelated event does not inherit a hometown, and returning from a place "
-            + "immediately after the period supports presence there. "
-            + "For 'when' questions, use the matched evidence's granularity: "
-            + "'7 May 2023', 'May 2023', '2023', or 'the week/weekend/Sunday before "
-            + "25 May 2023'; preserve a week or weekend as that anchored period rather "
-            + "than an ISO date range. Preserve 'next month', 'last week', 'a few days ago', and "
-            + "approximate durations at their supported granularity, "
-            + "with no additional words. For 'how long' questions, return the "
-            + "duration exactly as written in the conversation. Do not exclude a source merely because "
-            + "the question's person is not the literal speaker of that turn; match the complete event "
-            + "and its requested attribute before resolving its time."
-        )
-    if locomo_category == 3:
-        return question + " No extra explanations in 'answer'. Give reasons with original text in 'reason'. "
-
-    category = _category_id(category)
-    if category == "multi-session":
-        return (
-            question
-            + " Resolve every requested relation jointly across all relevant sessions. Before answering, "
-            + "build an internal ledger with one row per distinct qualifying event or item and its dialogue id. "
-            + "For count/list questions, merge repeated descriptions of the same event, but keep distinct "
-            + "completed events. Exclude plans, goals, feelings, advice, and topic-neighbor facts unless asked. "
-            + "For multiple people, evaluate each person before the requested union or intersection. Output only the answer."
-        )
-    if category == "temporal-reasoning":
-        return (
-            question
-            + " Match the exact event before resolving time. Use the question date, source session_datetime, "
-            + "and original relative wording together; retrieval rank is not authority. Prefer any matching "
-            + "Deterministic Temporal Calculation and copy its answer_text exactly. Preserve the requested "
-            + "unit and supported granularity, and never substitute a similar event or invent a day-of-month."
-        )
-    if category == "knowledge-update":
-        return question + (
-            " Resolve all statements about the requested attribute as a state history. Prefer the latest "
-            "explicitly active state as of the question date. Treat corrections, replacements, completion, "
-            "cancellation, and changed plans as updates rather than independent answers."
-        )
-    if category == "single-session-preference":
-        return question + (
-            " Infer the user's durable preferences and constraints from the cited dialogue, then give concrete "
-            "useful recommendations satisfying them. Do not merely restate the preference or invent constraints."
-        )
-    if category == "single-session-assistant":
-        return question + (
-            " Treat assistant turns, quoted text, tables, and image descriptions as valid source evidence. "
-            "Return the exact requested attribute from that content."
-        )
-    return question
-
-
 def answer_question(
     question: str,
     loaded_memory: str,
     llm: LLMClient,
-    *,
-    category=None,
 ) -> dict:
-    original_question = _original_question_text(question, category)
+    original_question = str(question)
     if not loaded_memory.strip():
         # Never turn a retrieval/runtime gap into a fixed benchmark answer.
         # Let the normal answer model and its repair loop handle this edge case.
@@ -362,37 +267,22 @@ def answer_question(
             + "\n\nRejected draft response:\n"
             + rejected_draft
         )
-        result = llm.chat_json(answer_system, repair_user)
+        replacement = _chat_optional_answer_json(llm, answer_system, repair_user)
+        if not replacement:
+            answer_trace["refusal_schema_failed"] = True
+            break
+        result = replacement
 
     if _is_answer_refusal(result.get("answer", "")):
         result["_answer_trace"] = answer_trace
         return result
 
-    if _should_verify_multi_hop_answer(original_question, result, category):
-        logger.info("  Auditing an exhaustive Category 1 draft once")
-        answer_trace["multi_hop_verification_attempted"] = True
-        draft = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-        verify_user = MULTI_HOP_EXHAUSTIVE_USER.format(
-            question=original_question, loaded_memory=loaded_memory, draft=draft
-        )
-        verified = llm.chat_json(MULTI_HOP_EXHAUSTIVE_SYSTEM, verify_user)
-        if not str(verified.get("answer", "")).strip() or _is_answer_refusal(
-            verified.get("answer", "")
-        ):
-            logger.info("  Multi-hop verifier returned no concrete answer; retaining the draft")
-            answer_trace["multi_hop_verifier_rejected"] = True
-            if hasattr(llm, "discard_last_response_usage"):
-                llm.discard_last_response_usage()
-        else:
-            answer_trace["multi_hop_revision_applied"] = _verification_changed(
-                result, verified
-            )
-            result = verified
-    elif _should_verify_temporal_answer(original_question, category):
-        logger.info("  Auditing a high-risk Category 2 temporal draft once")
+    if _should_verify_temporal_answer(original_question):
+        logger.info("  Auditing a temporal draft once")
         answer_trace["temporal_verification_attempted"] = True
         draft = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-        verified = llm.chat_json(
+        verified = _chat_optional_answer_json(
+            llm,
             TEMPORAL_AUDIT_SYSTEM,
             TEMPORAL_AUDIT_USER.format(
                 question=original_question, loaded_memory=loaded_memory, draft=draft
@@ -402,15 +292,35 @@ def answer_question(
             verified.get("answer", "")
         ):
             answer_trace["temporal_verifier_rejected"] = True
-            if hasattr(llm, "discard_last_response_usage"):
+            if verified and hasattr(llm, "discard_last_response_usage"):
                 llm.discard_last_response_usage()
         else:
             answer_trace["temporal_revision_applied"] = _verification_changed(
                 result, verified
             )
             result = verified
-    elif _should_verify_open_domain_geography(question, category):
-        logger.info("  Verifying a Category 3 geographic answer once")
+    elif _should_verify_multi_hop_answer(original_question, result):
+        logger.info("  Auditing an exhaustive count/list draft once")
+        answer_trace["multi_hop_verification_attempted"] = True
+        draft = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        verify_user = MULTI_HOP_EXHAUSTIVE_USER.format(
+            question=original_question, loaded_memory=loaded_memory, draft=draft
+        )
+        verified = _chat_optional_answer_json(llm, MULTI_HOP_EXHAUSTIVE_SYSTEM, verify_user)
+        if not str(verified.get("answer", "")).strip() or _is_answer_refusal(
+            verified.get("answer", "")
+        ):
+            logger.info("  Multi-hop verifier returned no concrete answer; retaining the draft")
+            answer_trace["multi_hop_verifier_rejected"] = True
+            if verified and hasattr(llm, "discard_last_response_usage"):
+                llm.discard_last_response_usage()
+        else:
+            answer_trace["multi_hop_revision_applied"] = _verification_changed(
+                result, verified
+            )
+            result = verified
+    elif _should_verify_open_domain_geography(question):
+        logger.info("  Verifying a geographic answer once")
         answer_trace["open_domain_geographic_verification_attempted"] = True
         draft = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         verify_user = OPEN_DOMAIN_GEOGRAPHY_USER.format(
@@ -418,7 +328,7 @@ def answer_question(
             loaded_memory=loaded_memory,
             draft=draft,
         )
-        verified = llm.chat_json(OPEN_DOMAIN_GEOGRAPHY_SYSTEM, verify_user)
+        verified = _chat_optional_answer_json(llm, OPEN_DOMAIN_GEOGRAPHY_SYSTEM, verify_user)
         if not str(verified.get("answer", "")).strip() or _is_answer_refusal(
             verified.get("answer", "")
         ):
@@ -426,15 +336,15 @@ def answer_question(
                 "  Geographic verifier returned no concrete answer; retaining the draft"
             )
             answer_trace["open_domain_geographic_verifier_rejected"] = True
-            if hasattr(llm, "discard_last_response_usage"):
+            if verified and hasattr(llm, "discard_last_response_usage"):
                 llm.discard_last_response_usage()
         else:
             answer_trace["open_domain_geographic_revision_applied"] = (
                 _verification_changed(result, verified)
             )
             result = verified
-    elif _should_verify_open_domain_alternative(question, result, category):
-        logger.info("  Verifying a Category 3 alternative-choice answer once")
+    elif _should_verify_open_domain_alternative(question, result):
+        logger.info("  Verifying an alternative-choice answer once")
         answer_trace["open_domain_alternative_verification_attempted"] = True
         draft = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         verify_user = OPEN_DOMAIN_ALTERNATIVE_USER.format(
@@ -442,7 +352,7 @@ def answer_question(
             loaded_memory=loaded_memory,
             draft=draft,
         )
-        verified = llm.chat_json(OPEN_DOMAIN_ALTERNATIVE_SYSTEM, verify_user)
+        verified = _chat_optional_answer_json(llm, OPEN_DOMAIN_ALTERNATIVE_SYSTEM, verify_user)
         verified_answer = str(verified.get("answer", "")).strip()
         if (
             not verified_answer
@@ -453,7 +363,7 @@ def answer_question(
                 "  Alternative-choice verifier returned no specific choice; retaining the draft"
             )
             answer_trace["open_domain_alternative_verifier_rejected"] = True
-            if hasattr(llm, "discard_last_response_usage"):
+            if verified and hasattr(llm, "discard_last_response_usage"):
                 llm.discard_last_response_usage()
         else:
             answer_trace["open_domain_alternative_revision_applied"] = (
@@ -461,13 +371,13 @@ def answer_question(
             )
             result = verified
 
-    if _should_verify_single_hop_answer(question, result, category):
-        logger.info("  Verifying a high-risk Category 4 exact-attribute draft once")
+    if _should_verify_single_hop_answer(question, result):
+        logger.info("  Verifying a high-risk exact-attribute draft once")
         answer_trace["single_hop_verification_attempted"] = True
         draft = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         verify_user = (
             user
-            + "\n\nRecheck this Category 4 draft against every entity, date, and event "
+            + "\n\nRecheck this draft against every entity, date, and event "
             + "constraint. Find the fact that states the exact requested attribute. "
             + "Prefer the specific name, title, color, food, game, movie, instrument, "
             + "place, type, emotion, quote, or advice over a generic category or nearby "
@@ -475,11 +385,11 @@ def answer_question(
             + "schema and no explanation.\n\nDraft:\n"
             + draft
         )
-        verified = llm.chat_json(answer_system, verify_user)
+        verified = _chat_optional_answer_json(llm, answer_system, verify_user)
         verified_answer = str(verified.get("answer", "")).strip()
         if not verified_answer or _is_answer_refusal(verified_answer):
             answer_trace["single_hop_verifier_rejected"] = True
-            if hasattr(llm, "discard_last_response_usage"):
+            if verified and hasattr(llm, "discard_last_response_usage"):
                 llm.discard_last_response_usage()
         else:
             answer_trace["single_hop_revision_applied"] = _verification_changed(
@@ -491,6 +401,41 @@ def answer_question(
     return result
 
 
+def _usable_answer_payload(result: object) -> bool:
+    if not isinstance(result, dict):
+        return False
+    answer = result.get("answer")
+    if (isinstance(answer, bool) or not isinstance(answer, (str, int, float))
+            or not str(answer).strip()):
+        return False
+    if isinstance(answer, float) and not math.isfinite(answer):
+        return False
+    for key in ("supports", "evidence"):
+        if key in result and (not isinstance(result[key], list)
+                              or not all(isinstance(item, str) for item in result[key])):
+            return False
+    if "confidence" in result:
+        confidence = result["confidence"]
+        if (isinstance(confidence, bool) or not isinstance(confidence, (int, float))
+                or not 0 <= confidence <= 1 or not math.isfinite(confidence)):
+            return False
+    return True
+
+
+def _chat_optional_answer_json(llm: LLMClient, system: str, user: str) -> dict:
+    """Reject malformed optional audits without losing the valid draft.
+
+    Only parse/schema failures are caught. Network/authentication/timeouts still
+    propagate to the pipeline's existing retry/resume handling.
+    """
+    try:
+        result, _ = _chat_nonempty_answer_json(llm, system, user)
+        return result
+    except ValueError:
+        logger.warning("Optional answer check returned invalid JSON/schema; retaining the draft")
+        return {}
+
+
 def _chat_nonempty_answer_json(
     llm: LLMClient,
     system: str,
@@ -500,18 +445,18 @@ def _chat_nonempty_answer_json(
 ) -> tuple[dict, int]:
     result = llm.chat_json(system, user)
     for repair_number in range(0, max_repairs + 1):
-        if isinstance(result, dict) and str(result.get("answer", "")).strip():
-            return result, repair_number
+        if _usable_answer_payload(result):
+            return {**result, "answer": str(result["answer"]).strip()}, repair_number
+        if hasattr(llm, "discard_last_response_usage"):
+            llm.discard_last_response_usage()
         if repair_number >= max_repairs:
             break
         logger.info(
             "  Answer generator returned JSON without a concrete answer; "
-            "running same-GPT schema repair %d/%d",
+            "running answer-model schema repair %d/%d",
             repair_number + 1,
             max_repairs,
         )
-        if hasattr(llm, "discard_last_response_usage"):
-            llm.discard_last_response_usage()
         rejected = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         repair_user = (
             user
@@ -522,7 +467,7 @@ def _chat_nonempty_answer_json(
         )
         result = llm.chat_json(system, repair_user)
     raise ValueError(
-        "Answer generator returned no non-empty answer after same-GPT schema repairs"
+        "Answer generator returned no valid answer object after schema repairs"
     )
 
 
@@ -531,72 +476,45 @@ def _is_answer_refusal(answer) -> bool:
     return bool(text) and any(pattern.search(text) for pattern in ANSWER_REFUSAL_PATTERNS)
 
 
-def _original_question_text(question: str, category) -> str:
-    locomo_marker = {
-        1: " Resolve every requested relation jointly",
-        2: " First identify the exact event using all person",
-        3: " No extra explanations in 'answer'",
-    }.get(_locomo_category(category))
-    if locomo_marker and locomo_marker in str(question or ""):
-        return str(question or "").split(locomo_marker, 1)[0]
-    marker = {
-        "multi-session": " Resolve every requested relation jointly",
-        "temporal-reasoning": " Match the exact event before resolving time",
-        "knowledge-update": " Resolve all statements about the requested attribute",
-        "single-session-preference": " Infer the user's durable preferences",
-        "single-session-assistant": " Treat assistant turns",
-    }.get(_category_id(category))
-    return str(question or "").split(marker, 1)[0] if marker and marker in str(question or "") else str(question or "")
-
-
-def _should_verify_multi_hop_answer(question: str | dict, result: dict | int, category=None) -> bool:
-    if category is None:
+def _should_verify_multi_hop_answer(question: str, result: dict) -> bool:
+    # "Which country" and "which ... or ..." are not exhaustive lists just
+    # because they contain "which". Let the more specific checks handle them.
+    if (_should_verify_open_domain_geography(question)
+            or _should_verify_open_domain_alternative(question, result)):
         return False
-    del result
-    category_id = _category_id(category)
-    return (_locomo_category(category) == 1 or category_id == "multi-session") and bool(re.search(
+    return bool(re.search(
         r"\b(?:how many|which|what (?:are|were|kinds|types|places|items|books|games|hobbies|skills|ways|causes|recommendations))\b",
         str(question or ""), re.I,
     ))
 
 
-def _should_verify_temporal_answer(question: str, category) -> bool:
-    locomo_category = _locomo_category(category)
-    if locomo_category == 2:
-        text = str(question or "")
-        return bool(
-            re.search(r"\b(?:how long|after how many|start(?:ed)?|begin|began|first|last|before|after|during|since|as of|finish(?:ed)?|found|visit(?:ed)?|go|went|which city|where)\b", text, re.I)
-            or re.search(r"\bwhen\b.*\b(?:make|made|was|were)\b", text, re.I)
-        )
-    if _category_id(category) != "temporal-reasoning":
-        return False
-    return True
+def _should_verify_temporal_answer(question: str) -> bool:
+    # Wording alone supplies intent. In particular, "where" and "which city"
+    # are not sufficient to turn a geographic lookup into a temporal audit.
+    return bool(re.search(
+        r"\b(?:when|how long|what (?:date|year|month|day|time)|"
+        r"how many (?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)|"
+        r"before|after|during|since|as of)\b",
+        str(question or ""), re.I,
+    ))
 
 
-def _should_verify_open_domain_geography(question: str, category) -> bool:
-    if _locomo_category(category) != 3 and _category_id(category) != "open-domain":
-        return False
+def _should_verify_open_domain_geography(question: str) -> bool:
     text = str(question or "")
-    return bool(
-        OPEN_DOMAIN_GEOGRAPHY_QUESTION_PATTERN.search(text)
-        and OPEN_DOMAIN_GEOGRAPHY_TERM_PATTERN.search(text)
-    )
+    return bool(OPEN_DOMAIN_GEOGRAPHY_QUESTION_PATTERN.search(text)
+                and OPEN_DOMAIN_GEOGRAPHY_TERM_PATTERN.search(text))
 
 
-def _should_verify_open_domain_alternative(question: str, result: dict, category) -> bool:
-    if _locomo_category(category) != 3 and _category_id(category) != "open-domain":
-        return False
+def _should_verify_open_domain_alternative(question: str, result: dict) -> bool:
     return bool(
         OPEN_DOMAIN_ALTERNATIVE_PATTERN.search(str(question or ""))
         and not OPEN_DOMAIN_EXPLICIT_BINARY_PATTERN.search(str(question or ""))
-        and OPEN_DOMAIN_BINARY_ANSWER_PATTERN.fullmatch(
-            str(result.get("answer", ""))
-        )
+        and OPEN_DOMAIN_BINARY_ANSWER_PATTERN.fullmatch(str(result.get("answer", "")))
     )
 
 
-def _should_verify_single_hop_answer(question: str, result: dict, category) -> bool:
-    del question, result, category
+def _should_verify_single_hop_answer(question: str, result: dict) -> bool:
+    del question, result
     return False
 
 
@@ -617,6 +535,7 @@ def prediction_key(sample_id, question_id) -> tuple[str, str]:
 def question_fingerprint(sample: dict, qa: dict) -> str:
     payload = {
         "question": qa.get("question"),
+        "question_date": (sample.get("metadata") or {}).get("question_date"),
         "answer": qa.get("answer"),
         "evidence": qa.get("evidence", []),
         "category": qa.get("category"),
@@ -679,6 +598,10 @@ def prediction_fingerprint(
         "memory_sha256": memory_fingerprint(sample_memory_dir),
         "model": str(model),
         "stage_version": STAGE_CHECKPOINT_VERSION,
+        "query_policy": QUERY_POLICY_VERSION,
+        "planner_prompt_sha256": hashlib.sha256(
+            (QUERY_PLANNING_SYSTEM + QUERY_PLANNING_USER).encode()
+        ).hexdigest(),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1010,8 +933,13 @@ def run_qa_question(
 
     question = str(qa.get("question", ""))
     metadata = sample.get("metadata") if isinstance(sample.get("metadata"), dict) else {}
-    category = _category_id(qa.get("category") or metadata.get("question_type"))
     question_date = str(metadata.get("question_date") or "")
+    # Keep benchmark labels and gold answers outside all generation helpers.
+    generation_sample = {
+        "sample_id": sample_id,
+        "conversation": sample.get("conversation", {}),
+        "metadata": {"question_date": question_date} if question_date else {},
+    }
     prediction_sha256 = prediction_fingerprint(
         sample, qa, sample_memory_dir, str(getattr(llm, "model", ""))
     )
@@ -1030,8 +958,8 @@ def run_qa_question(
         stage="candidate_retrieval",
         fingerprint=stage_fp("candidate_retrieval"),
         operation=lambda: initial_candidates(
-            sample_memory_dir, sample, question, llm,
-            category=category, question_date=question_date,
+            sample_memory_dir, generation_sample, question, llm,
+            question_date=question_date,
         ),
         uses_llm=True,
     )
@@ -1046,12 +974,11 @@ def run_qa_question(
         fingerprint=stage_fp("program_execution"),
         operation=lambda: plan_and_execute(
             sample_memory_dir=sample_memory_dir,
-            sample=sample,
+            sample=generation_sample,
             question=question,
             llm=llm,
             trace_dir=trace_dir,
             candidates=dict(candidates),
-            category=category,
             question_date=question_date,
         ),
         uses_llm=True,
@@ -1069,10 +996,9 @@ def run_qa_question(
             sample_memory_dir,
         )
         result = answer_question(
-            format_final_question_for_mragent(question, category),
+            question,
             loaded,
             llm,
-            category=category,
         )
         execution = dict(program_artifact.get("execution", {}))
         evidence = execution.get("result", {})
@@ -1102,7 +1028,7 @@ def run_qa_question(
                 "status": program_artifact.get("status"),
                 "attempts": program_artifact.get("attempts", []),
                 "executed_rules": evidence.get("rules", []) if isinstance(evidence, dict) else [],
-                "category_search_profile": candidates.get("category_search_profile", {}),
+                "query_policy": QUERY_POLICY_VERSION,
             },
         }
 

@@ -17,6 +17,7 @@ from typing import Any
 from .cost_metrics import merge_metrics, metric_is_complete, usage_metric
 from .llm_client import LLMClient, capture_token_usage
 from .utils import ensure_dir, read_json, write_json
+from .prompt_contracts import FACT_TO_CODE_SYSTEM, FACT_TO_CODE_USER, FACT_TO_CODE_POLICY_VERSION
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,10 @@ STATE_LINK_BATCH_FACTS = 96
 STRUCTURAL_RELATIONS = {"temporal_before", "same_subject", "shared_topic"}
 SEMANTIC_PARTIAL_DIR = "semantic_batches"
 SEMANTIC_PARTIAL_SCHEMA = "semantic_batch_checkpoint_v1"
+# ASCII identifiers leave room for .py, view prefixes and Python bytecode tags
+# within the usual 255-byte filesystem component limit.
+MAX_CODE_IDENTIFIER_LENGTH = 180
+MEMORY_CODE_LAYOUT_VERSION = "bounded_function_modules_v1"
 
 
 def semantic_batch_size() -> int:
@@ -50,35 +55,9 @@ def _resume_ignores_llm_configuration() -> bool:
         "1", "true", "yes", "on",
     }
 
-SEMANTIC_COMPILER_SYSTEM = """You compile canonical dialogue facts into a code-native memory specification.
-Return valid JSON only. Do not invent facts. Each fact will become one named pure Python
-function in a subject module. Choose a short snake_case function_name describing the fact,
-a compact open-ended query predicate, a JSON-compatible value, optional JSON-object
-attributes, and whether the fact is a time-varying state. Do not infer or output any
-state-to-state link in this phase. State links are resolved in a
-separate phase after all facts have been semantically parsed. Do not create ordinary
-fact-to-fact graph relations. All generated base functions return the same open MemoryValue
-runtime type; do not classify facts into a fixed type ontology."""
+SEMANTIC_COMPILER_SYSTEM = FACT_TO_CODE_SYSTEM
+SEMANTIC_COMPILER_USER = FACT_TO_CODE_USER
 
-SEMANTIC_COMPILER_USER = """Compile these facts.
-
-Output exactly:
-{
-  "facts": [
-    {
-      "fact_id": "...",
-      "function_name": "snake_case_name",
-      "predicate": "...",
-      "value": "string, number, or object",
-      "attributes": {"optional_key": "optional JSON-compatible value"},
-      "stateful": false
-    }
-  ]
-}
-
-Input facts:
-{{facts}}
-"""
 
 STATE_LINK_SYSTEM = """You resolve explicit state-update links over already parsed dialogue facts.
 Return valid JSON only. A link means the successor fact explicitly replaces the predecessor
@@ -105,6 +84,7 @@ Output exactly:
 def semantic_compiler_fingerprint(model: str) -> str:
     payload = {
         "version": SEMANTIC_SCHEMA_VERSION,
+        "prompt_policy": FACT_TO_CODE_POLICY_VERSION,
         "model": str(model),
         "batch_size": semantic_batch_size(),
         "state_link_batch_facts": STATE_LINK_BATCH_FACTS,
@@ -179,6 +159,7 @@ def compile_semantic_specs(
         )
         write_json({
             "schema": "semantic_fact_specs_v5",
+            "prompt_policy": FACT_TO_CODE_POLICY_VERSION,
             "sample_id": sample_id,
             "compiler_fingerprint": fingerprint,
             "facts_by_id_sha256": facts_sha256,
@@ -215,7 +196,8 @@ def emit_compiled_memory(
     # The model is part of the semantic checkpoint identity.  Read the saved
     # payload directly here: its own fingerprint was checked before writing.
     payload = read_json(sample_dir / "semantic_specs.json")
-    if not isinstance(payload, dict) or payload.get("sample_id") != sample_id:
+    if (not isinstance(payload, dict) or payload.get("sample_id") != sample_id
+            or payload.get("prompt_policy") != FACT_TO_CODE_POLICY_VERSION):
         raise ValueError(f"missing or invalid semantic specs for {sample_id}")
     if payload.get("facts_by_id_sha256") != facts_sha256:
         raise ValueError(f"semantic specs do not match canonical facts for {sample_id}")
@@ -347,6 +329,7 @@ def _read_partial_batch(
         return None
     if not (
         payload.get("schema") == SEMANTIC_PARTIAL_SCHEMA
+        and payload.get("prompt_policy") == FACT_TO_CODE_POLICY_VERSION
         and payload.get("phase") == phase
         and payload.get("index") == index
         and payload.get("sample_id") == sample_id
@@ -386,6 +369,7 @@ def _write_partial_batch(
     write_json(
         {
             "schema": SEMANTIC_PARTIAL_SCHEMA,
+            "prompt_policy": FACT_TO_CODE_POLICY_VERSION,
             "phase": phase,
             "index": index,
             "sample_id": sample_id,
@@ -711,8 +695,8 @@ def emit_memory_code(*, facts: list[dict[str, Any]], specs: list[dict[str, Any]]
         for ordinal, fact in enumerate(facts, start=1)
     ]
     _assign_unique_function_names(records)
-    # Every atomic fact is a standalone importable module.  The function name
-    # is globally unique, so it is also a stable code-file name and lookup key.
+    # Keep filenames equal to the globally unique, filesystem-safe function
+    # names. All imports and indexes use this same mapping.
     for record in records:
         record["module"] = f"facts.{record['function_name']}"
     links = _read_structural_links(sample_dir / "fact_graph.json", records)
@@ -746,6 +730,7 @@ def emit_memory_code(*, facts: list[dict[str, Any]], specs: list[dict[str, Any]]
             obsolete.unlink()
     return {
         "schema": RUNTIME_SCHEMA_VERSION,
+        "code_layout": MEMORY_CODE_LAYOUT_VERSION,
         "fact_count": len(records),
         "function_count": len(function_index["functions"]),
         "function_index_sha256": _sha256_file(sample_dir / "function_index.json"),
@@ -816,7 +801,23 @@ def _assign_unique_function_names(records: list[dict[str, Any]]) -> None:
     for name, items in groups.items():
         if len(items) > 1:
             for item in sorted(items, key=lambda value: value["fact_id"]):
-                item["function_name"] = f"{name}__{_safe_identifier(item['fact_id'])}"
+                item["function_name"] = _bounded_code_identifier(
+                    f"{name}__{_safe_identifier(item['fact_id'])}"
+                )
+    # A generated duplicate suffix may itself match another model-supplied
+    # name. Resolve those collisions before deriving any paths or references.
+    used: set[str] = set()
+    for record in sorted(records, key=lambda item: item["fact_id"]):
+        base = _bounded_code_identifier(record["function_name"])
+        candidate = base
+        attempt = 0
+        while candidate in used:
+            attempt += 1
+            candidate = _bounded_code_identifier(
+                f"{base}__{_safe_identifier(record['fact_id'])}_{attempt}"
+            )
+        record["function_name"] = candidate
+        used.add(candidate)
 
 
 def _read_structural_links(path: Path, records: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -873,7 +874,7 @@ def _write_runtime_package(
 
 
 def _write_fact_module(code_dir: Path, record: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> None:
-    """Write exactly one atomic function into its own facts/<function>.py file."""
+    """Write one atomic function into facts/<function_name>.py."""
 
     path = code_dir / Path(*record["module"].split(".")).with_suffix(".py")
     lines = ["from code.memory_runtime import MemoryValue, fact, source, topics", ""]
@@ -881,7 +882,7 @@ def _write_fact_module(code_dir: Path, record: dict[str, Any], by_id: dict[str, 
     if predecessor in by_id:
         previous = by_id[predecessor]
         lines.extend([
-            f"from .{previous['function_name']} import {previous['function_name']}",
+            f"from .{previous['module'].split('.')[-1]} import {previous['function_name']}",
             "",
         ])
     supersedes = by_id[predecessor]["function_name"] if predecessor in by_id else "None"
@@ -970,7 +971,7 @@ def _write_concept_modules(
                 f"    return history({names}, as_of=as_of)",
                 "",
             ])
-        (code_dir / "concept" / f"person_{_safe_identifier(subject)}.py").write_text("\n".join(lines), encoding="utf-8")
+        (code_dir / "concept" / f"person_{_code_identifier(subject)}.py").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _write_topic_concept_modules(code_dir: Path, records: list[dict[str, Any]]) -> None:
@@ -979,7 +980,7 @@ def _write_topic_concept_modules(code_dir: Path, records: list[dict[str, Any]]) 
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         for topic in record["topics"]:
-            grouped[_safe_identifier(topic)].append(record)
+            grouped[_code_identifier(topic)].append(record)
     for topic, items in grouped.items():
         lines: list[str] = []
         _append_fact_imports(lines, items)
@@ -995,7 +996,7 @@ def _write_view_modules(
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         for key in keys(record):
-            grouped[_safe_identifier(key)].append(record)
+            grouped[_code_identifier(key)].append(record)
     for key, items in grouped.items():
         lines: list[str] = []
         _append_fact_imports(lines, items)
@@ -1038,11 +1039,11 @@ def _function_index(
             "search": search,
         })
     for (subject, predicate), chain in sorted(derived_groups.items()):
-        module, suffix = f"concept.person_{_safe_identifier(subject)}", _safe_identifier(predicate)
+        module, suffix = f"concept.person_{_code_identifier(subject)}", _safe_identifier(predicate)
         for operation in ("current", "history"):
             function_name = f"{operation}_{suffix}"
             out.append({
-                "id": f"concept.person_{_safe_identifier(subject)}.{function_name}",
+                "id": f"concept.person_{_code_identifier(subject)}.{function_name}",
                 "entrypoint": f"{module}:{function_name}",
                 "subject": subject,
                 "predicate": predicate,
@@ -1071,13 +1072,13 @@ def _view_index(
     for record in records:
         by_subject[record["subject"]].append(record)
         for topic in record["topics"]:
-            by_topic[_safe_identifier(topic)].append(record)
+            by_topic[_code_identifier(topic)].append(record)
         for session_id in record["session_ids"]:
-            by_session[_safe_identifier(session_id)].append(record)
+            by_session[_code_identifier(session_id)].append(record)
 
     derived_by_subject: dict[str, list[str]] = defaultdict(list)
     for (subject, predicate) in sorted(derived_groups):
-        subject_id, predicate_id = _safe_identifier(subject), _safe_identifier(predicate)
+        subject_id, predicate_id = _code_identifier(subject), _safe_identifier(predicate)
         for operation in ("current", "history"):
             derived_by_subject[subject].append(
                 f"concept.person_{subject_id}.{operation}_{predicate_id}"
@@ -1096,7 +1097,7 @@ def _view_index(
 
     for subject, items in sorted(by_subject.items(), key=lambda item: _safe_identifier(item[0])):
         append_view(
-            f"concept.person_{_safe_identifier(subject)}",
+            f"concept.person_{_code_identifier(subject)}",
             items,
             derived_by_subject.get(subject, []),
         )
@@ -1117,6 +1118,7 @@ def _read_semantic_specs(path: Path, sample_id: str, fingerprint: str, facts_sha
         return None
     if (
         payload.get("schema") == "semantic_fact_specs_v5"
+        and payload.get("prompt_policy") == FACT_TO_CODE_POLICY_VERSION
         and payload.get("sample_id") == sample_id
         and (
             payload.get("compiler_fingerprint") == fingerprint
@@ -1137,7 +1139,21 @@ def _fallback_function_name(fact: dict[str, Any], predicate: str) -> str:
 
 def _safe_function_name(value: Any) -> str:
     result = _safe_identifier(value)
-    return "" if result == "other" or keyword.iskeyword(result) else result
+    return "" if result == "other" or keyword.iskeyword(result) else _bounded_code_identifier(result)
+
+
+def _bounded_code_identifier(identifier: str) -> str:
+    """Bound code names with a stable hash; factual content is never shortened."""
+    if len(identifier) <= MAX_CODE_IDENTIFIER_LENGTH:
+        return identifier
+    suffix = "__" + hashlib.sha256(identifier.encode("utf-8")).hexdigest()[:16]
+    return identifier[:MAX_CODE_IDENTIFIER_LENGTH - len(suffix)] + suffix
+
+
+def _code_identifier(value: Any) -> str:
+    # Keep semantic predicates, subjects, values and sources unabridged;
+    # this helper is only for generated module/path components.
+    return _bounded_code_identifier(_safe_identifier(value))
 
 
 def _safe_identifier(value: Any) -> str:

@@ -43,7 +43,6 @@ def prepare_retrieval_bundle(
     question: str,
     llm: LLMClient,
     *,
-    category: str = "",
     question_date: str = "",
 ) -> dict[str, Any]:
     """Build the base evidence routes for one question.
@@ -58,7 +57,7 @@ def prepare_retrieval_bundle(
     function_index = _function_index(sample_dir)
     view_index = _view_index(sample_dir)
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="code-recall") as pool:
-        code_future = pool.submit(_code_recall, question, function_index, category)
+        code_future = pool.submit(_code_recall, question, function_index)
         terms = extract_retrieval_terms(question, llm)
         code_candidates, code_metadata = code_future.result()
     keyword_matches = keyword_recall_facts(facts_by_id, terms, limit=KEYWORD_RECALL_LIMIT)
@@ -81,7 +80,7 @@ def prepare_retrieval_bundle(
     base_facts = [facts_by_id[fact_id] for fact_id in merged_fact_ids if fact_id in facts_by_id]
     context = build_source_context(
         sample, base_facts, question=question, terms=terms,
-        category=category, question_date=question_date,
+        question_date=question_date,
     )
 
     origins = {}
@@ -92,9 +91,9 @@ def prepare_retrieval_bundle(
             "keyword_recall": fact_id in set(keyword_fact_ids),
         }
     return {
-        "schema": "query_bundle_v4",
+        "schema": "query_bundle_v5",
         "question": question,
-        "question_context": {"category": category, "question_date": question_date},
+        "question_context": {"question_date": question_date},
         "resolve": {
             "candidate_functions": code_candidates,
             "function_ids": [str(item.get("id", "")) for item in code_candidates],
@@ -192,10 +191,9 @@ def build_answer_context(
     temporal_computations = list(context.get("temporal_computations", [])) if isinstance(context, dict) else []
     lines: list[str] = []
     question_context = bundle.get("question_context", {}) if isinstance(bundle, dict) else {}
-    if isinstance(question_context, dict) and any(question_context.values()):
+    if isinstance(question_context, dict) and question_context.get("question_date"):
         lines.extend([
             "# Question Context", "",
-            f"- category: {question_context.get('category', '')}",
             f"- question_date: {question_context.get('question_date', '')}",
             "- question_date is the temporal cutoff for current/latest-state questions.",
             "",
@@ -302,9 +300,9 @@ def _view_index(sample_dir: Path) -> list[dict[str, Any]]:
     return views
 
 
-def _code_recall(question: str, functions: list[dict[str, Any]], category: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _code_recall(question: str, functions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     retrieval_question = _expanded_retrieval_query(question)
-    prefilter_limit = HIGH_COVERAGE_CODE_PREFILTER_LIMIT if _needs_high_coverage(question, category) else CODE_RECALL_PREFILTER_LIMIT
+    prefilter_limit = HIGH_COVERAGE_CODE_PREFILTER_LIMIT if _needs_high_coverage(question) else CODE_RECALL_PREFILTER_LIMIT
     lexical = _rank_records(retrieval_question, functions, limit=prefilter_limit)
     projected = []
     for item in lexical:
@@ -470,12 +468,11 @@ def _rank_records(question: str, records: list[dict[str, Any]], *, limit: int) -
 
 
 def build_source_context(
-    sample: dict[str, Any], ranked_facts: list[dict[str, Any]], *, question: str = "", terms: dict[str, Any] | None = None, category: str = "", question_date: str = "",
+    sample: dict[str, Any], ranked_facts: list[dict[str, Any]], *, question: str = "", terms: dict[str, Any] | None = None, question_date: str = "",
 ) -> dict[str, Any]:
     source_index = _source_dialogue_index(sample)
     anchor_facts = _select_source_anchors(
         ranked_facts, question, _normalise_terms(terms or {}), source_index,
-        category=category,
     )
     lines, dialogue_ids = [], []
     seen: set[str] = set()
@@ -736,18 +733,18 @@ def _parse_session_datetime(value: Any) -> datetime | None:
         return None
 
 
-def _needs_high_coverage(question: str, category: str = "") -> bool:
+def _needs_high_coverage(question: str) -> bool:
     text = str(question or "")
     hard_form = bool(re.search(r"\b(?:when|how long|how many|what date|what year|what month|which|what (?:are|were|kinds|types|places|items|books|games|hobbies|skills|ways))\b", text, re.I))
     explicit_period = bool(re.search(r"\b(?:(?:19|20)\d{2}|january|february|march|april|may|june|july|august|september|october|november|december)\b", text, re.I))
-    return str(category) in {"multi-session", "temporal-reasoning", "knowledge-update"} or hard_form or explicit_period
+    return hard_form or explicit_period
 
 
 def _select_source_anchors(
-    ranked_facts: list[dict[str, Any]], question: str, terms: dict[str, Any], source_index: dict[tuple[int, int], dict[str, Any]], *, category: str = "",
+    ranked_facts: list[dict[str, Any]], question: str, terms: dict[str, Any], source_index: dict[tuple[int, int], dict[str, Any]],
 ) -> list[dict[str, Any]]:
     base = list(ranked_facts[:SOURCE_FACT_LIMIT])
-    if not _needs_high_coverage(question, category):
+    if not _needs_high_coverage(question):
         return base
     explicit_years = set(re.findall(r"\b(?:19|20)\d{2}\b", question))
     month_names = "january|february|march|april|may|june|july|august|september|october|november|december"
@@ -780,7 +777,7 @@ def _select_source_anchors(
         if fact_id not in seen:
             base.append(fact)
             seen.add(fact_id)
-        supplemental_limit = HIGH_COVERAGE_SUPPLEMENTAL_SOURCE_FACT_LIMIT if _needs_high_coverage(question, category) else SUPPLEMENTAL_SOURCE_FACT_LIMIT
+        supplemental_limit = HIGH_COVERAGE_SUPPLEMENTAL_SOURCE_FACT_LIMIT if _needs_high_coverage(question) else SUPPLEMENTAL_SOURCE_FACT_LIMIT
         if len(base) >= SOURCE_FACT_LIMIT + supplemental_limit:
             break
     return base

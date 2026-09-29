@@ -245,15 +245,34 @@ def _extract_session_facts(
         session_count,
         len(formatted),
     )
-    user = _build_session_extraction_prompt(
-        sample_id=sample_id,
-        speaker_a=speaker_a,
-        speaker_b=speaker_b,
-        sess=sess,
-        session_messages=formatted,
-    )
-    result = llm.chat_json(SESSION_MEMORY_EXTRACTOR_SYSTEM, user)
-    return _clean_extracted_facts(result, sample_id, sess)
+    fact_limits = _extraction_fact_limits()
+    last_error: ValueError | None = None
+    for fact_limit in fact_limits:
+        user = _build_session_extraction_prompt(
+            sample_id=sample_id,
+            speaker_a=speaker_a,
+            speaker_b=speaker_b,
+            sess=sess,
+            session_messages=formatted,
+            fact_limit=fact_limit,
+        )
+        try:
+            result = llm.chat_json(SESSION_MEMORY_EXTRACTOR_SYSTEM, user)
+        except ValueError as exc:
+            last_error = exc
+            if fact_limit == fact_limits[-1]:
+                raise
+            next_limit = fact_limits[fact_limits.index(fact_limit) + 1]
+            logger.warning(
+                "  Invalid JSON for %s/%s at fact limit %d; retrying with limit %d",
+                sample_id,
+                sess["session_id"],
+                fact_limit,
+                next_limit,
+            )
+            continue
+        return _clean_extracted_facts(result, sample_id, sess, max_facts=fact_limit)
+    raise last_error or RuntimeError("Fact extraction did not produce a response")
 
 
 def _build_session_extraction_prompt(
@@ -262,6 +281,7 @@ def _build_session_extraction_prompt(
     speaker_b: str,
     sess: dict,
     session_messages: str,
+    fact_limit: int | None = None,
 ) -> str:
     user = fill_template(
         SESSION_MEMORY_EXTRACTOR_USER,
@@ -272,7 +292,8 @@ def _build_session_extraction_prompt(
         session_datetime=sess["datetime"],
         session_messages=session_messages,
     )
-    fact_limit = _session_fact_max_facts_per_call()
+    if fact_limit is None:
+        fact_limit = _session_fact_max_facts_per_call()
     limit_note = (
         f"Extraction limit: return at most {fact_limit} high-value atomic facts. "
         "Prioritize user-specific memories, user-stated preferences, plans, events, places, "
@@ -284,9 +305,17 @@ def _build_session_extraction_prompt(
     return user
 
 
-def _clean_extracted_facts(result: dict, sample_id: str, sess: dict) -> list[dict]:
+def _clean_extracted_facts(
+    result: dict,
+    sample_id: str,
+    sess: dict,
+    *,
+    max_facts: int | None = None,
+) -> list[dict]:
     facts = []
-    for fact in result.get("atomic_facts", [])[: _session_fact_max_facts_per_call()]:
+    if max_facts is None:
+        max_facts = _session_fact_max_facts_per_call()
+    for fact in result.get("atomic_facts", [])[:max_facts]:
         if not isinstance(fact, dict):
             continue
         item = dict(fact)
@@ -306,6 +335,22 @@ def _session_fact_max_facts_per_call() -> int:
         return max(1, int(os.getenv("SESSION_FACT_MAX_FACTS_PER_CALL", str(DEFAULT_SESSION_FACT_MAX_FACTS_PER_CALL))))
     except ValueError:
         return DEFAULT_SESSION_FACT_MAX_FACTS_PER_CALL
+
+
+def _extraction_fact_limits() -> list[int]:
+    """Return bounded fallback limits for unusually long session responses.
+
+    A provider can truncate a large JSON array even when the request itself is
+    valid. Retrying the same long response cannot repair that case, so reduce
+    only the requested fact count for the affected session.
+    """
+    limits = [_session_fact_max_facts_per_call()]
+    while limits[-1] > 8:
+        next_limit = max(8, limits[-1] // 2)
+        if next_limit == limits[-1]:
+            break
+        limits.append(next_limit)
+    return limits
 
 
 def _session_max_workers() -> int:

@@ -19,6 +19,60 @@ The framework is illustrated below.
 
 The design provides reusable memory computations, complete one-plan retrieval instead of repeated stepwise planning, and per-question execution traces containing generated programs, validation outcomes, repair attempts, fact IDs, and source references.
 
+### Paper-aligned prompts and label-free generation
+
+The two appendix prompt cores are shared in `code/prompt_contracts.py`, with
+references in [Fact to Code](prompts/fact_to_code.md) and
+[Declarative Query Planning](prompts/declarative_query_planning.md). Runtime
+prompts append only the JSON output schema or read-only SDK interface contract.
+
+Benchmark question categories are retained for sample selection, prediction
+metadata, and grouped evaluation only. They are not passed to retrieval,
+planning, or answer generation, and do not choose a retrieval skeleton or
+answer instruction. Questions, source dialogue, and available dates are still
+used. General human-designed guidance is identical across questions; the
+planner determines the required operations. The fixed multi-route program is
+reserved for exhausted planning/repair failures and is not shown as the normal
+planning template. Answer audits use question wording and the draft, without
+an extra category-classification model call.
+
+This revision changes the experimental condition. Historical scores obtained
+with category-guided prompts must not be presented as scores for this revision
+without a new evaluation. QA cache version 32 and planner version 11 invalidate
+old generation checkpoints. Build version 14 and the fact-to-code policy tag
+prevent old semantic prompts from being silently reused, even with the legacy
+ignore-configuration option. Matching raw fact-extraction caches can still be
+reused. Old planning-failure traces cannot bypass the new planner; matching
+current-policy traces remain resumable. Existing experiment outputs are not
+migrated or deleted by this code update. Use a new `--output` directory when
+rerunning to preserve historical artifacts.
+
+Generated fact files retain the matching Python function name
+(`memory_code/facts/<function_name>.py`). Overlong names use a readable prefix
+plus a stable hash, bounded to 180 ASCII characters; short names and factual
+content remain unchanged. Imports and indexes use the same final names. Long
+view-file labels receive the same path-length protection. Build completion records check
+the code-layout version; rerunning an older layout regenerates local code and
+indexes while reusing compatible extraction and semantic checkpoints.
+
+Offline checks (no paid API calls or model downloads):
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
+```
+
+The `prompts/` directory contains only the two paper-appendix prompt references:
+[Fact to Code](prompts/fact_to_code.md) and
+[Declarative Query Planning](prompts/declarative_query_planning.md).
+Other runtime prompts remain defined in the Python implementation. Editing
+Markdown alone does not change runtime prompts. The current planner policy is
+`category_free_v2`; it retains the paper's core wording and makes the supported
+conditional syntax explicit. Malformed optional answer checks are retried at
+most twice for schema errors, then rejected in favor of the existing draft.
+The Judge now consistently requests label-only JSON; historical Judge results
+are not silently reused across this evaluation-policy revision.
+
+
 ## Run the Codes
 
 ### Repo Introduction
@@ -39,7 +93,7 @@ MaC/
 │   ├── locomo10.json               # LoCoMo input
 │   └── dataset_LM.json             # LongMemEval input
 ├── assets/framework.png            # framework figure
-├── prompts/                        # reference prompt documents
+├── prompts/                        # two paper-appendix prompt references
 ├── .env.example                    # API credential template
 ├── requirements.txt                # Python dependencies
 └── README.md                       # this file

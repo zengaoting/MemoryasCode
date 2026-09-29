@@ -30,6 +30,7 @@ from .memory_extractor import (
 )
 from .memory_builder import build_canonical_fact_artifacts
 from .semantic_compiler import (
+    MEMORY_CODE_LAYOUT_VERSION,
     compile_semantic_specs,
     emit_compiled_memory,
     replay_cached_semantic_cost,
@@ -37,10 +38,11 @@ from .semantic_compiler import (
 )
 from .qa_engine import prediction_key, prediction_fingerprint, read_completed_prediction_fingerprints, read_stage_metric_for_cost, run_qa_question, stage_checkpoint_path, stage_fingerprint_from_prediction
 from .utils import append_jsonl, ensure_dir, read_json, read_jsonl, write_json, write_jsonl
+from .prompt_contracts import FACT_TO_CODE_POLICY_VERSION, QUERY_POLICY_VERSION
 
 
 MEMORY_BUILD_DONE_FILE = "build.done.json"
-MEMORY_BUILDER_VERSION = 13
+MEMORY_BUILDER_VERSION = 14
 DEFERRED_QUESTIONS_SCHEMA = "deferred_questions_v1"
 QUESTION_EXECUTION_STAGES = (
     "candidate_retrieval",
@@ -745,9 +747,10 @@ def _memory_build_complete(
     stage_costs = done.get("stage_costs")
     return bool(
         done.get("sample_id") == sample_id
-        and done.get("schema") == "memory_build_done_v13"
+        and done.get("schema") == "memory_build_done_v14"
         and done.get("completed") is True
         and done.get("builder_version") == MEMORY_BUILDER_VERSION
+        and done.get("code_layout") == MEMORY_CODE_LAYOUT_VERSION
         and (
             expected_input_sha256 is None
             or done.get("input_sha256") == expected_input_sha256
@@ -837,8 +840,9 @@ def _write_memory_build_done(
 ) -> None:
     write_json(
         {
-            "schema": "memory_build_done_v13",
+            "schema": "memory_build_done_v14",
             "builder_version": MEMORY_BUILDER_VERSION,
+            "code_layout": runtime.get("code_layout"),
             "sample_id": sample_id,
             "completed": True,
             "fact_count": fact_count,
@@ -1393,6 +1397,8 @@ def _write_run_manifest(config: Config) -> None:
     write_json(
         {
             "schema": "mac_run_config_v1",
+            "fact_to_code_policy": FACT_TO_CODE_POLICY_VERSION,
+            "query_policy": QUERY_POLICY_VERSION,
             "llm_provider": config.llm_provider,
             "model": config.model,
             "dataset": config.dataset,

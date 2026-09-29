@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -16,226 +17,36 @@ from .program_language import ProgramValidationError, validate_program
 from .retrieval_pipeline import build_answer_context, prepare_retrieval_bundle
 from .llm_client import LLMClient
 from .utils import ensure_dir, read_json, write_json
+from .prompt_contracts import QUERY_PLANNING_SYSTEM, QUERY_PLANNING_USER, QUERY_POLICY_VERSION
 
 
-PROGRAM_SCHEMA_VERSION = 9
-CATEGORY_SEARCH_PROFILE_SCHEMA = "category_search_profile_v1"
+PROGRAM_SCHEMA_VERSION = 11
 DEFAULT_TIMEOUT_SECONDS = 5
 DEFAULT_MEMORY_MB = 512
 MAX_REPAIRS = 2
+PROGRAM_SYSTEM = QUERY_PLANNING_SYSTEM
+PROGRAM_USER = QUERY_PLANNING_USER
+PROGRAM_REPAIR_SUFFIX = """\n\nYour previous program failed validation/execution:
+{{error}}
+Rewrite the complete program for the question using the runtime interface contract.
+Correct the reported error while preserving compatible evidence dependencies.
+Do not use lambda or invented keyword arguments. Conditions must use direct report
+indexing, such as if report["needs_source"]:, with report obtained from
+memory.validate(). Use else for the opposite case, not .get(), not/and/or, or
+comparisons. Ensure result is evidence on every path, and expand_scope receives
+direct resolve evidence (optionally filtered by where/rank), not hydrated or merged evidence."""
 
-
-# LoCoMo's numeric labels are benchmark metadata, so preserve their original
-# retrieval profiles instead of making the planner infer them from wording.
-CATEGORY_SEARCH_PROFILES: dict[int, dict[str, Any]] = {
-    1: {
-        "name": "multi_hop",
-        "default_scope": ["concept", "session"],
-        "planner_guidance": (
-            "This is a multi-hop, list, intersection, or count question. Expand direct code hits through both "
-            "concept and session views before merging routes, so facts distributed across people, topics, and "
-            "sessions remain available. Use expand_relation or select(complete=True) only when the "
-            "wording actually requires a bridge, intersection, or exhaustive set."
-        ),
-    },
-    2: {
-        "name": "temporal",
-        "default_scope": ["session"],
-        "planner_guidance": (
-            "This is a temporal question. Expand direct code hits through session views before merging routes, "
-            "then hydrate to retain original dialogue wording and session timestamps. Use temporal_before only "
-            "when distinct ordered events must be linked."
-        ),
-    },
-    3: {
-        "name": "open_domain",
-        "default_scope": ["concept", "session"],
-        "planner_guidance": (
-            "This is an open-domain question. Expand direct code hits through concept and session views before "
-            "merging routes, then hydrate the merged evidence. Do not add broad structural graph expansion by default."
-        ),
-    },
-    4: {
-        "name": "single_hop",
-        "default_scope": [],
-        "planner_guidance": (
-            "This is a single-hop factual lookup. Use resolve/match/union/hydrate without default scope expansion, "
-            "because unrelated facts about the same person or topic can distract from an exact attribute."
-        ),
-    },
-}
-
-PROGRAM_SYSTEM = """Write one complete module-level Python search program over a read-only executable-memory SDK.
-Do not answer the question. Assign provenance-carrying memory Evidence to `result`.
-
-Use the recommended default skeleton unless the question clearly does not need one or more
-steps. `memory.resolve()` is the code-function route and `memory.match()` is the independent
-lexical-fact route; both are recommended, but neither is mandatory for every question.
-`memory.expand_scope(code, scopes=...)` is MaC2's optional concept/session expansion: it may
-only consume direct `resolve()` evidence, or that evidence narrowed by `where()` or `rank()`.
-Run it before `union()` or `hydrate()`, because merged/hydrated evidence no longer carries the
-function locator needed for scope expansion. When two or more evidence routes are used, normally
-merge them with `memory.union(...)`. `memory.hydrate(...)` is recommended before answering
-because it materialises canonical facts and source windows, but direct Evidence may be returned
-when already sufficient.
-
-All other operations are question-specific choices: `expand_relation`, `select`, `where`,
-`execute`, `aggregate`, `rank`, and `validate`. Use `execute(function_id)`
-for compact function candidates. Never import, loop, define a function/class, access
-files/network, or modify memory.
-
-Allowed calls: resolve, expand_scope, match, union, expand_relation, rank, hydrate,
-execute, select, search, search_functions, where, aggregate, validate. Every operation must
-consume compatible earlier evidence, and `result` must be memory
-Evidence rather than a constant, catalog record, or validation report.
-
-STRICT SDK CALL CARD — use only these call shapes.  If no extra operation is needed, copy
-the default skeleton verbatim.  `resolve()` and `match()` take ZERO arguments.
-```
-code = memory.resolve()
-lexical = memory.match()
-scoped = memory.expand_scope(code, scopes=["concept", "session"])
-evidence = memory.union(code, lexical)
-evidence = memory.union(evidence, scoped)
-evidence = memory.where(evidence, start="YYYY-MM-DD", end="YYYY-MM-DD")
-evidence = memory.rank(evidence, limit=36)
-evidence = memory.expand_relation(evidence, relations=["temporal_before"])
-evidence = memory.select(subject="Name", predicate="event", topics=["topic"], complete=True, limit=24)
-evidence = memory.aggregate(evidence, operation="count")
-report = memory.validate("question text", evidence)
-result = memory.hydrate(evidence)
-```
-For `select`, every argument is keyword-only.  `where` supports only `start` and `end`;
-it does NOT accept `predicate`.  `rank` supports only `limit`; `aggregate` supports only
-`operation`; `validate` needs both the question string and evidence.  Do NOT use lambda,
-comprehensions, loops, imports, `key=`, `fields=`, or any unlisted keyword.  Write the
-complete program directly without prose."""
-
+# Emergency fallback only; never shown in normal planning prompts.
 PROGRAM_TEMPLATE = """code = memory.resolve()
 scoped = memory.expand_scope(code, scopes=["concept", "session"])
-# RECOMMENDED_DEFAULT: retain an independent lexical route unless it adds no evidence.
 lexical = memory.match()
 evidence = memory.union(memory.union(code, scoped), lexical)
-# OPTIONAL_QUESTION_SPECIFIC_OPERATIONS
 result = memory.hydrate(evidence)"""
 
-PROGRAM_USER = """Question:
-{{question}}
 
-Compact code candidates (index only; no copied fact text):
-{{functions}}
-
-Recommended default skeleton:
-{{program_template}}
-
-Write the complete Python program. Prefer the full default because independent code, scope, and
-lexical routes usually improve recall, but omit any step that is clearly unnecessary for this
-question. Scope expansion, when selected, must consume direct resolve evidence (or resolve
-evidence filtered only by where/rank) before union or hydrate. If multiple routes are retained,
-normally union them; hydrate before answering when the additional canonical fact/source context
-is useful. Add zero or more allowed question-specific assignments only by copying a call shape
-from the STRICT SDK CALL CARD.  Never invent Python filtering logic: especially never use a
-lambda or `where(predicate=...)`.  If uncertain, return the supplied default skeleton unchanged.
-The final `result` must be memory Evidence, never a textual answer or a catalog record."""
-
-# Original LoCoMo planner prompts, selected for its numeric categories.
-LOCOMO_PROGRAM_SYSTEM = """Write one complete module-level Python search program over a read-only executable-memory SDK.
-Do not answer the question. Assign provenance-carrying memory Evidence to `result`.
-
-Use the category-profile skeleton unless the question clearly makes an additional step
-unnecessary. `memory.resolve()` is the code-function route and `memory.match()` is the
-independent lexical-fact route. Recommend retaining both routes, unioning them, and hydrating
-their merged evidence: this is the common recall-and-source-evidence base for every
-LoCoMo category.
-`memory.expand_scope(code, scopes=...)` is MaC2's optional concept/session expansion: it may
-only consume direct `resolve()` evidence, or that evidence narrowed by `where()` or `rank()`.
-Run it before `union()` or `hydrate()`, because merged/hydrated evidence no longer carries the
-function locator needed for scope expansion. When two or more evidence routes are used, normally
-merge them with `memory.union(...)`. `memory.hydrate(...)` is recommended before answering
-because it materialises canonical facts and source windows, but direct Evidence may be returned
-when already sufficient.
-
-All other operations are question-specific choices: `expand_relation`, `select`, `where`,
-`execute`, `aggregate`, `rank`, and `validate`. Use `execute(function_id)`
-for compact function candidates. Never import, loop, define a function/class, access
-files/network, or modify memory.
-
-Allowed calls: resolve, expand_scope, match, union, expand_relation, rank, hydrate,
-execute, select, search, search_functions, where, aggregate, validate. Every operation must
-consume compatible earlier evidence, and `result` must be memory
-Evidence rather than a constant, catalog record, or validation report. Write the complete
-program directly without prose."""
-
-LOCOMO_PROGRAM_USER = """Question:
-{{question}}
-
-Known LoCoMo category search profile:
-{{category_search_profile}}
-
-Compact code candidates (index only; no copied fact text):
-{{functions}}
-
-Recommended default skeleton:
-{{program_template}}
-
-Write the complete Python program. Prefer the full default because independent code, scope, and
-lexical routes usually improve recall, but omit any step that is clearly unnecessary for this
-question. Scope expansion, when selected, must consume direct resolve evidence (or resolve
-evidence filtered only by where/rank) before union or hydrate. If multiple routes are retained,
-normally union them; hydrate before answering when the additional canonical fact/source context
-is useful. Add zero or more allowed question-specific assignments. The final `result` must be
-memory Evidence, never a textual answer or a catalog record."""
-
-
-def _locomo_category(category: object) -> int | None:
-    value = str(category or "").strip()
-    return int(value) if value in {"1", "2", "3", "4"} else None
-
-
-def category_search_profile(category: object) -> dict[str, Any]:
-    """Return LoCoMo's serialisable category profile, if applicable."""
-    category_id = _locomo_category(category)
-    if category_id is None:
-        return {}
-    profile = CATEGORY_SEARCH_PROFILES[category_id]
-    return {
-        "schema": CATEGORY_SEARCH_PROFILE_SCHEMA,
-        "category": category_id,
-        "name": str(profile["name"]),
-        "default_scope": list(profile["default_scope"]),
-        "planner_guidance": str(profile["planner_guidance"]),
-        "common_recommendations": ["resolve", "match", "union", "hydrate"],
-    }
-
-
-def recommended_program_template(category: object = None) -> str:
-    """Return the original category-aware LoCoMo fallback, or the LongMem default."""
-    profile = category_search_profile(category)
-    if not profile:
-        return PROGRAM_TEMPLATE
-    scope = profile["default_scope"]
-    lines = ["code = memory.resolve()"]
-    if scope:
-        lines.append(f"scoped = memory.expand_scope(code, scopes={scope!r})")
-    lines.append("lexical = memory.match()")
-    lines.append(
-        "evidence = memory.union(memory.union(code, scoped), lexical)"
-        if scope else "evidence = memory.union(code, lexical)"
-    )
-    lines.append("result = memory.hydrate(evidence)")
-    return "\n".join(lines)
-
-
-def deterministic_retrieval_program(category: object = None) -> str:
-    """Return the valid baseline program used only after planner exhaustion.
-
-    Program synthesis is allowed to add question-specific calls, but a malformed
-    program must never be converted into a false ``Not mentioned`` answer.  This
-    baseline follows the recommended multi-route default and returns the
-    resulting provenance-carrying context to the answer model.
-    """
-
-    return recommended_program_template(category)
+def deterministic_retrieval_program() -> str:
+    """Category-independent fallback used only after planner exhaustion."""
+    return PROGRAM_TEMPLATE
 
 
 class ProgramExecutionError(RuntimeError):
@@ -254,28 +65,25 @@ def initial_candidates(
     question: str,
     llm: LLMClient,
     *,
-    category: str = "",
     question_date: str = "",
 ) -> dict[str, Any]:
-    """Prepare the two parallel recalls and mandatory graph/context bundle."""
+    """Prepare query-only candidate routes and their source context."""
 
     bundle = prepare_retrieval_bundle(
         sample_memory_dir,
         sample,
         question,
         llm,
-        category=category,
         question_date=question_date,
     )
     functions = bundle.get("resolve", {}).get("candidate_functions", [])
     compact_functions = [_compact_function(item) for item in functions[:8]]
     final_facts = bundle.get("final", {}).get("facts", [])
     return {
-        "schema": "program_candidates_v4",
+        "schema": "program_candidates_v5",
         "retrieval_bundle": bundle,
         "candidate_functions": compact_functions,
         "candidate_fact_ids": [str(item.get("fact_id", "")) for item in final_facts],
-        "category_search_profile": category_search_profile(category),
     }
 
 
@@ -284,25 +92,14 @@ def _compact_function(item: dict[str, Any]) -> dict[str, Any]:
     return {key: item.get(key) for key in keys if item.get(key) not in (None, "", [], {})}
 
 
-def _program_guidance(category: str, question_date: str) -> str:
-    """Return the relevant benchmark's planning hints without changing SDK semantics."""
-
-    locomo_profile = category_search_profile(category)
-    if locomo_profile:
-        return (
-            f"Benchmark: LoCoMo category {locomo_profile['category']} ({locomo_profile['name']})\n"
-            f"Planner guidance: {locomo_profile['planner_guidance']}"
-        )
-
-    guidance = {
-        "multi-session": "Use complete=True queries for counts or lists; deduplicate one repeated event before aggregate().",
-        "temporal-reasoning": "Match every named event before temporal filtering; the question date is authoritative for relative-time questions.",
-        "knowledge-update": "Retrieve complete value history and prefer an active-state derivation over an older mention.",
-        "single-session-preference": "Retrieve durable user constraints before a recommendation.",
-        "single-session-assistant": "Assistant-authored facts and visual captions are valid evidence when requested.",
-        "single-session-user": "Prefer the exact user-authored fact matching all requested attributes.",
-    }.get(str(category), "")
-    return f"Benchmark category: {category or 'unknown'}\nQuestion date: {question_date or 'unknown'}\nPlanner guidance: {guidance}"
+def _planner_fingerprint(system: str, user: str, bundle: dict, sample: dict, model: str) -> str:
+    payload = {
+        "policy": QUERY_POLICY_VERSION, "schema": PROGRAM_SCHEMA_VERSION,
+        "system": system, "user": user, "bundle": bundle,
+        "conversation": sample.get("conversation", {}), "model": model,
+        "fallback": PROGRAM_TEMPLATE,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 def plan_and_execute(
@@ -313,7 +110,6 @@ def plan_and_execute(
     llm: LLMClient,
     trace_dir: str | Path,
     candidates: dict[str, Any] | None = None,
-    category: str = "",
     question_date: str = "",
 ) -> dict[str, Any]:
     """Generate a complete constrained program and execute it safely."""
@@ -325,7 +121,7 @@ def plan_and_execute(
         try:
             path.relative_to(project_root)
         except ValueError as exc:
-            raise ProgramExecutionError(f"{label} must be inside MaC2") from exc
+            raise ProgramExecutionError(f"{label} must be inside MaC") from exc
     ensure_dir(trace_path)
     if candidates is None:
         candidates = initial_candidates(
@@ -333,11 +129,9 @@ def plan_and_execute(
             sample,
             question,
             llm,
-            category=category,
             question_date=question_date,
         )
     bundle = dict(candidates.get("retrieval_bundle", {}))
-    locomo_profile = dict(candidates.get("category_search_profile") or {})
     write_json(bundle, trace_path / "retrieval_bundle.json")
     write_json(
         {"schema": "function_index_candidates_v1", "functions": candidates.get("candidate_functions", [])},
@@ -357,26 +151,25 @@ def plan_and_execute(
             "question": question,
             "candidate_functions": candidates.get("candidate_functions", []),
             "candidate_fact_ids": candidates.get("candidate_fact_ids", []),
-            "category_search_profile": candidates.get("category_search_profile", {}),
+            "query_policy": QUERY_POLICY_VERSION,
         },
         trace_path / "planner_input.json",
     )
-    prompt_template = LOCOMO_PROGRAM_USER if locomo_profile else PROGRAM_USER
-    planner_system = LOCOMO_PROGRAM_SYSTEM if locomo_profile else PROGRAM_SYSTEM
+    planner_system = PROGRAM_SYSTEM
     user = (
-        prompt_template.replace("{{question}}", question)
+        PROGRAM_USER.replace("{{question}}", question)
         .replace("{{functions}}", json.dumps(candidates.get("candidate_functions", []), ensure_ascii=False))
-        .replace("{{category_search_profile}}", json.dumps(candidates.get("category_search_profile", {}), ensure_ascii=False))
-        .replace("{{program_template}}", recommended_program_template(category))
     )
-    user += "\n\n" + _program_guidance(category, question_date)
+    if question_date:
+        user += "\n\nQuestion date: " + question_date
+    planner_fingerprint = _planner_fingerprint(
+        planner_system, user, bundle, sample, str(getattr(llm, "model", ""))
+    )
 
-    prior_exhaustion = _read_prior_planner_exhaustion(trace_path)
+    prior_exhaustion = _read_prior_planner_exhaustion(trace_path, planner_fingerprint)
     if prior_exhaustion:
-        # This question was previously written as a false ``Not mentioned``
-        # solely because all planner repairs had failed.  Re-execute its
-        # retrieval deterministically instead of repeating the same costly
-        # planner failure loop.
+        # Only an exhausted attempt with identical current-policy inputs can
+        # resume directly through the category-independent fallback.
         return _run_deterministic_fallback(
             attempts=prior_exhaustion,
             sample_memory_dir=sample_memory_dir,
@@ -384,7 +177,7 @@ def plan_and_execute(
             trace_path=trace_path,
             bundle=bundle,
             candidates=candidates,
-            category=category,
+            planner_fingerprint=planner_fingerprint,
         )
 
     attempts = []
@@ -405,7 +198,7 @@ def plan_and_execute(
                 retrieval_bundle=bundle,
             )
             attempts.append({"attempt": attempt_number, "program_path": program_path.name, "status": "ok"})
-            write_json({"schema": "program_attempts_v2", "attempts": attempts}, trace_path / "attempts.json")
+            write_json({"schema": "program_attempts_v3", "planner_fingerprint": planner_fingerprint, "attempts": attempts}, trace_path / "attempts.json")
             return {
                 "status": "ok",
                 "program": full_program,
@@ -417,7 +210,7 @@ def plan_and_execute(
             }
         except (ProgramValidationError, ProgramExecutionError) as exc:
             attempts.append({"attempt": attempt_number, "program_path": program_path.name, "status": "failed", "error": str(exc)})
-            write_json({"schema": "program_attempts_v2", "attempts": attempts}, trace_path / "attempts.json")
+            write_json({"schema": "program_attempts_v3", "planner_fingerprint": planner_fingerprint, "attempts": attempts}, trace_path / "attempts.json")
             if attempt_number >= MAX_REPAIRS:
                 return _run_deterministic_fallback(
                     attempts=attempts,
@@ -426,25 +219,22 @@ def plan_and_execute(
                     trace_path=trace_path,
                     bundle=bundle,
                     candidates=candidates,
-                    category=category,
+                    planner_fingerprint=planner_fingerprint,
                 )
-            instruction = (
-                user
-                + "\n\nYour previous program failed validation/execution:\n"
-                + str(exc)
-                + "\nRewrite the complete program. Start by copying the recommended default skeleton "
-                "exactly; add an optional operation only if its call shape appears verbatim in the "
-                "STRICT SDK CALL CARD. Do not use lambda or invented keyword arguments."
-            )
+            instruction = user + PROGRAM_REPAIR_SUFFIX.replace("{{error}}", str(exc))
     raise AssertionError("unreachable")
 
 
-def _read_prior_planner_exhaustion(trace_path: Path) -> list[dict[str, Any]]:
-    """Return a legacy three-repair failure trace, if this question has one."""
+def _read_prior_planner_exhaustion(trace_path: Path, planner_fingerprint: str) -> list[dict[str, Any]]:
+    """Reuse exhausted attempts only for the same policy and planning inputs."""
 
     path = trace_path / "attempts.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(payload, dict)
+                or payload.get("schema") != "program_attempts_v3"
+                or payload.get("planner_fingerprint") != planner_fingerprint):
+            return []
         raw_attempts = payload.get("attempts", []) if isinstance(payload, dict) else []
     except (OSError, json.JSONDecodeError):
         return []
@@ -468,11 +258,11 @@ def _run_deterministic_fallback(
     trace_path: Path,
     bundle: dict[str, Any],
     candidates: dict[str, Any],
-    category: object = None,
+    planner_fingerprint: str,
 ) -> dict[str, Any]:
     """Execute the fixed baseline instead of abstaining after planner failures."""
 
-    program = deterministic_retrieval_program(category) + "\n"
+    program = deterministic_retrieval_program() + "\n"
     program_path = trace_path / "search_program_deterministic_fallback.py"
     program_path.write_text(program, encoding="utf-8")
     try:
@@ -493,7 +283,7 @@ def _run_deterministic_fallback(
                 "error": str(exc),
             }
         )
-        write_json({"schema": "program_attempts_v2", "attempts": attempts}, trace_path / "attempts.json")
+        write_json({"schema": "program_attempts_v3", "planner_fingerprint": planner_fingerprint, "attempts": attempts}, trace_path / "attempts.json")
         raise ProgramExecutionError(
             "deterministic fallback failed after planner exhaustion"
         ) from exc
@@ -506,7 +296,7 @@ def _run_deterministic_fallback(
             "reason": "planner_generation_failed",
         }
     )
-    write_json({"schema": "program_attempts_v2", "attempts": attempts}, trace_path / "attempts.json")
+    write_json({"schema": "program_attempts_v3", "planner_fingerprint": planner_fingerprint, "attempts": attempts}, trace_path / "attempts.json")
     return {
         "status": "ok",
         "program": program,
@@ -540,7 +330,7 @@ def run_in_sandbox(
         try:
             path.relative_to(project_root)
         except ValueError as exc:
-            raise ProgramExecutionError(f"{label} must be inside MaC2") from exc
+            raise ProgramExecutionError(f"{label} must be inside MaC") from exc
     ensure_dir(trace_path)
     request_path = trace_path / "sandbox_request.json"
     write_json(

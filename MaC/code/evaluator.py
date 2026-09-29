@@ -95,10 +95,8 @@ Question: {question}
 Gold answer: {gold_answer}
 Generated answer: {generated_answer}
 
-First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
-Do NOT include both CORRECT and WRONG in your response, or it will break the evaluation script.
-
-Just return the label CORRECT or WRONG in a json format with the key as "label".
+Return only a JSON object with the key "label" and exactly one value: "CORRECT" or "WRONG".
+Do not include an explanation, Markdown, or both labels.
 """
 
 
@@ -119,7 +117,7 @@ def evaluate_llm_judge(
     last_label = ""
     for _ in range(max_retries):
         result = llm.chat_json_mode(system="", user=retry_prompt, temperature=0.0)
-        label = str(result.get("label", "")).strip().upper()
+        label = str(result.get("label", "")).strip().upper() if isinstance(result, dict) else ""
         if label in {"CORRECT", "WRONG"}:
             return 1 if label == "CORRECT" else 0
         if hasattr(llm, "discard_last_response_usage"):
