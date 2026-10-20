@@ -1,4 +1,4 @@
-"""Safe, read-only Python subset for MaC search programs."""
+"""Safe, read-only Python subset for MaC2 search programs."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ class ProgramValidationError(ValueError):
 
 _ALLOWED = {
     "resolve", "expand_scope", "match", "union", "expand_relation", "rank", "hydrate",
-    "execute", "select", "search", "search_functions",
-    "where", "aggregate", "validate",
+    "execute", "materialize", "select", "search", "search_functions",
+    "where", "join", "aggregate", "validate", "fetch",
 }
 _STATEMENTS = (ast.Assign, ast.If, ast.Expr, ast.Pass)
 _EXPRESSIONS = (ast.Name, ast.Constant, ast.List, ast.Tuple, ast.Dict, ast.Call,
@@ -76,18 +76,10 @@ def validate_program(program: str) -> ast.Module:
                 expression(statement.value)
             elif isinstance(statement, ast.If):
                 if not isinstance(statement.test, ast.Subscript):
-                    raise ProgramValidationError(
-                        'Use if report["needs_source"]: (or another validation-report key); '
-                        'do not use .get(), not, and/or, comparisons, or evidence truth tests.'
-                    )
+                    raise ProgramValidationError("if conditions must read a validate result key")
                 expression(statement.test)
-                before = set(assigned)
                 block(statement.body)
-                after_then = set(assigned)
-                assigned.clear()
-                assigned.update(before)
                 block(statement.orelse)
-                assigned.intersection_update(after_then)
 
     block(tree.body)
     if "result" not in assigned:
@@ -134,10 +126,7 @@ def _flow_value(node: ast.AST, values: dict[str, _FlowValue]) -> _FlowValue:
     if isinstance(node, ast.Name):
         return values.get(node.id, _FlowValue(_LITERAL))
     if isinstance(node, ast.Subscript):
-        container = _flow_value(node.value, values)
-        if container.kind == _EVIDENCE and isinstance(node.slice, ast.Constant) and type(node.slice.value) is int:
-            return container
-        return _FlowValue(_LITERAL)
+        return _flow_value(node.value, values)
     if isinstance(node, (ast.List, ast.Tuple)):
         items = [_flow_value(item, values) for item in node.elts]
         if items and all(item.kind == _EVIDENCE for item in items):
@@ -153,7 +142,7 @@ def _flow_value(node: ast.AST, values: dict[str, _FlowValue]) -> _FlowValue:
         if node.args or node.keywords:
             raise ProgramValidationError(f"memory.{method}() takes no arguments")
         return _FlowValue(_EVIDENCE, scope_seed=method == "resolve")
-    if method in {"execute", "select", "search"}:
+    if method in {"materialize", "execute", "select", "search"}:
         return _FlowValue(_EVIDENCE)
     if method == "search_functions":
         return _FlowValue(_CATALOG)
@@ -169,7 +158,7 @@ def _flow_value(node: ast.AST, values: dict[str, _FlowValue]) -> _FlowValue:
                 "memory.expand_scope(...) must consume direct resolve() evidence or resolve() filtered by where()/rank()"
             )
         return _FlowValue(_EVIDENCE)
-    if method in {"where", "rank", "expand_relation", "hydrate", "aggregate"}:
+    if method in {"where", "rank", "expand_relation", "hydrate", "aggregate", "fetch"}:
         evidence = _argument(node, 0, "evidence")
         if evidence is None:
             raise ProgramValidationError(f"memory.{method}(...) requires evidence input")
@@ -183,6 +172,13 @@ def _flow_value(node: ast.AST, values: dict[str, _FlowValue]) -> _FlowValue:
         _need_evidence(_flow_value(left, values), method)
         _need_evidence(_flow_value(right, values), method)
         return _FlowValue(_EVIDENCE)
+    if method == "join":
+        left, right = _argument(node, 0, "left"), _argument(node, 1, "right")
+        if left is None or right is None:
+            raise ProgramValidationError("memory.join(...) requires left and right evidence")
+        _need_evidence(_flow_value(left, values), method)
+        _need_evidence(_flow_value(right, values), method)
+        return _FlowValue(_EVIDENCE)
     if method == "validate":
         evidence = _argument(node, 1, "evidence")
         if evidence is None:
@@ -193,38 +189,12 @@ def _flow_value(node: ast.AST, values: dict[str, _FlowValue]) -> _FlowValue:
 
 
 def _validate_flow(tree: ast.Module) -> None:
-    def block(statements: list[ast.stmt], incoming: dict[str, _FlowValue]) -> dict[str, _FlowValue]:
-        values = dict(incoming)
-        for statement in statements:
-            if isinstance(statement, ast.Assign):
-                values[statement.targets[0].id] = _flow_value(statement.value, values)
-            elif isinstance(statement, ast.Expr):
-                _flow_value(statement.value, values)
-            elif isinstance(statement, ast.If):
-                condition = statement.test
-                if (not isinstance(condition, ast.Subscript)
-                        or not isinstance(condition.value, ast.Name)
-                        or values.get(condition.value.id, _FlowValue(_LITERAL)).kind != _REPORT
-                        or not isinstance(condition.slice, ast.Constant)
-                        or condition.slice.value not in (
-                            "sufficient", "needs_source", "coverage", "fact_ids", "unresolved_state"
-                        )):
-                    raise ProgramValidationError(
-                        'Conditions must index a known key of a memory.validate() report, '
-                        'for example if report["needs_source"]:.'
-                    )
-                left = block(statement.body, values)
-                right = block(statement.orelse, values)
-                values = {
-                    name: _FlowValue(
-                        left[name].kind if left[name].kind == right[name].kind else "mixed",
-                        scope_seed=left[name].scope_seed and right[name].scope_seed,
-                    )
-                    for name in left.keys() & right.keys()
-                }
-        return values
-
-    values = block(tree.body, {})
+    values: dict[str, _FlowValue] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+            continue
+        values[statement.targets[0].id] = _flow_value(statement.value, values)
     result = values.get("result")
     if result is None or result.kind != _EVIDENCE:
         raise ProgramValidationError("result must be provenance-carrying evidence from the memory SDK")
+

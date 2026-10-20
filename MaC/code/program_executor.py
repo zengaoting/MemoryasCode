@@ -17,36 +17,161 @@ from .program_language import ProgramValidationError, validate_program
 from .retrieval_pipeline import build_answer_context, prepare_retrieval_bundle
 from .llm_client import LLMClient
 from .utils import ensure_dir, read_json, write_json
-from .prompt_contracts import QUERY_PLANNING_SYSTEM, QUERY_PLANNING_USER, QUERY_POLICY_VERSION
+from .prompt_contracts import QUERY_POLICY_VERSION
+from .benchmark import policy_fingerprint
+from . import benchmark, prompts
 
 
-PROGRAM_SCHEMA_VERSION = 11
+PROGRAM_SCHEMA_VERSION = 12
 DEFAULT_TIMEOUT_SECONDS = 5
 DEFAULT_MEMORY_MB = 512
 MAX_REPAIRS = 2
-PROGRAM_SYSTEM = QUERY_PLANNING_SYSTEM
-PROGRAM_USER = QUERY_PLANNING_USER
-PROGRAM_REPAIR_SUFFIX = """\n\nYour previous program failed validation/execution:
-{{error}}
-Rewrite the complete program for the question using the runtime interface contract.
-Correct the reported error while preserving compatible evidence dependencies.
-Do not use lambda or invented keyword arguments. Conditions must use direct report
-indexing, such as if report["needs_source"]:, with report obtained from
-memory.validate(). Use else for the opposite case, not .get(), not/and/or, or
-comparisons. Ensure result is evidence on every path, and expand_scope receives
-direct resolve evidence (optionally filtered by where/rank), not hydrated or merged evidence."""
-
-# Emergency fallback only; never shown in normal planning prompts.
-PROGRAM_TEMPLATE = """code = memory.resolve()
-scoped = memory.expand_scope(code, scopes=["concept", "session"])
-lexical = memory.match()
-evidence = memory.union(memory.union(code, scoped), lexical)
-result = memory.hydrate(evidence)"""
 
 
-def deterministic_retrieval_program() -> str:
-    """Category-independent fallback used only after planner exhaustion."""
-    return PROGRAM_TEMPLATE
+CATEGORY_SEARCH_PROFILE_SCHEMA = "category_search_profile_v1"
+
+
+CATEGORY_SEARCH_PROFILES: dict[int, dict[str, Any]] = {
+    1: {
+        "name": "multi_hop",
+        "default_scope": ["concept", "session"],
+        "planner_guidance": (
+            "This is a multi-hop, list, intersection, or count-oriented question. "
+            "Strongly recommend expanding direct code hits through both concept and "
+            "session views before merging routes, so facts distributed across people, "
+            "topics, and sessions remain available. Use expand_relation, join, or "
+            "select(complete=True) only when the wording actually requires a bridge, "
+            "intersection, or exhaustive set; structural graph neighbors alone do not "
+            "prove that a fact satisfies every question constraint."
+        ),
+    },
+    2: {
+        "name": "temporal",
+        "default_scope": ["session"],
+        "planner_guidance": (
+            "This is a temporal question. Strongly recommend expanding direct code hits "
+            "through session views before merging routes, then hydrate to retain original "
+            "dialogue wording and session timestamps. Use where() only for explicit "
+            "absolute date bounds. Use temporal_before expansion only when the question "
+            "requires linking distinct ordered events; do not filter away relative-time "
+            "evidence merely because it lacks a precise normalized date."
+        ),
+    },
+    3: {
+        "name": "open_domain",
+        "default_scope": ["concept", "session"],
+        "planner_guidance": (
+            "This is an open-domain question using MaC2's original standard search "
+            "profile. Strongly recommend expanding direct code hits through both concept "
+            "and session views before merging routes, then hydrate the merged evidence. "
+            "Do not add broad structural graph expansion by default: shared-topic neighbors "
+            "are not necessarily premises for the inference."
+        ),
+    },
+    4: {
+        "name": "single_hop",
+        "default_scope": [],
+        "planner_guidance": (
+            "This is a single-hop factual lookup. Strongly recommend the shared "
+            "resolve/match/union/hydrate base without default scope or graph expansion, "
+            "because unrelated facts about the same person or topic can distract from an "
+            "exact attribute. Add scope expansion only when the two base routes are sparse, "
+            "conflicting, or the question needs local context to disambiguate an event."
+        ),
+    },
+}
+
+
+def category_search_profile(category: object) -> dict[str, Any]:
+    """Return an audit-safe, serialisable profile for one evaluated category."""
+
+    try:
+        category_id = int(category)
+    except (TypeError, ValueError):
+        category_id = 4
+    profile = CATEGORY_SEARCH_PROFILES.get(category_id, CATEGORY_SEARCH_PROFILES[4])
+    return {
+        "schema": CATEGORY_SEARCH_PROFILE_SCHEMA,
+        "category": category_id,
+        "name": str(profile["name"]),
+        "default_scope": list(profile["default_scope"]),
+        "planner_guidance": str(profile["planner_guidance"]),
+        "common_strong_recommendations": ["resolve", "match", "union", "hydrate"],
+    }
+
+
+def recommended_program_template(category: object = None) -> str:
+    """Build the category-specific planner skeleton from the shared base."""
+
+    profile = category_search_profile(category)
+    scope = profile["default_scope"]
+    lines = ["code = memory.resolve()"]
+    if scope:
+        lines.append(f"scoped = memory.expand_scope(code, scopes={scope!r})")
+    lines.extend(["lexical = memory.match()"])
+    if scope:
+        lines.append("evidence = memory.union(memory.union(code, scoped), lexical)")
+    else:
+        lines.append("evidence = memory.union(code, lexical)")
+    lines.append("result = memory.hydrate(evidence)")
+    return "\n".join(lines)
+
+
+def _program_guidance(category: str, question_date: str) -> str:
+    """Keep LongMem-specific planning hints without changing SDK semantics."""
+
+    guidance = {
+        "multi-session": "Use complete=True queries for counts or lists; deduplicate one repeated event before aggregate().",
+        "temporal-reasoning": "Match every named event before temporal filtering; the question date is authoritative for relative-time questions.",
+        "knowledge-update": "Retrieve complete value history and prefer an active-state derivation over an older mention.",
+        "single-session-preference": "Retrieve durable user constraints before a recommendation.",
+        "single-session-assistant": "Assistant-authored facts and visual captions are valid evidence when requested.",
+        "single-session-user": "Prefer the exact user-authored fact matching all requested attributes.",
+    }.get(str(category), "")
+    return f"Benchmark category: {category or 'unknown'}\nQuestion date: {question_date or 'unknown'}\nPlanner guidance: {guidance}"
+
+
+def planner_prompt_templates() -> tuple[str, str, str]:
+    """Return the active planner's system text, user template, and base program."""
+    if benchmark.is_locomo():
+        return prompts.LOCOMO_PROGRAM_SYSTEM, prompts.LOCOMO_PROGRAM_USER, prompts.PROGRAM_TEMPLATE
+    return prompts.LONGMEMEVAL_PROGRAM_SYSTEM, prompts.LONGMEMEVAL_PROGRAM_USER, prompts.PROGRAM_TEMPLATE
+
+
+def deterministic_retrieval_program(category=None) -> str:
+    """Return the valid baseline program used only after planner exhaustion.
+
+    Program synthesis is allowed to add question-specific calls, but a malformed
+    program must never be converted into a false ``Not mentioned`` answer.  This
+    baseline follows the recommended multi-route default and returns the
+    resulting provenance-carrying context to the answer model.
+    """
+
+    if benchmark.is_locomo():
+        return recommended_program_template(category)
+    return "\n".join(
+        (
+            "code = memory.resolve()",
+            "scoped = memory.expand_scope(code, scopes=['concept', 'session'])",
+            "lexical = memory.match()",
+            "evidence = memory.union(memory.union(code, scoped), lexical)",
+            "result = memory.hydrate(evidence)",
+        )
+    )
+
+
+def planner_prompts(question: str, functions: list[dict], *, category=None, question_date: str = "") -> tuple[str, str]:
+    """Render the exact reference planner request for the active benchmark."""
+    system, user_template, program_template = planner_prompt_templates()
+    template = recommended_program_template(category) if benchmark.is_locomo() else program_template
+    user = (user_template.replace("{{question}}", question)
+            .replace("{{functions}}", json.dumps(functions, ensure_ascii=False))
+            .replace("{{program_template}}", template))
+    if benchmark.is_locomo():
+        user = user.replace("{{category_search_profile}}", json.dumps(category_search_profile(category), ensure_ascii=False))
+    else:
+        user += "\n\n" + _program_guidance(str(category or ""), question_date)
+    return system, user
 
 
 class ProgramExecutionError(RuntimeError):
@@ -66,6 +191,7 @@ def initial_candidates(
     llm: LLMClient,
     *,
     question_date: str = "",
+    category=None,
 ) -> dict[str, Any]:
     """Prepare query-only candidate routes and their source context."""
 
@@ -75,6 +201,7 @@ def initial_candidates(
         question,
         llm,
         question_date=question_date,
+        category=category,
     )
     functions = bundle.get("resolve", {}).get("candidate_functions", [])
     compact_functions = [_compact_function(item) for item in functions[:8]]
@@ -84,6 +211,8 @@ def initial_candidates(
         "retrieval_bundle": bundle,
         "candidate_functions": compact_functions,
         "candidate_fact_ids": [str(item.get("fact_id", "")) for item in final_facts],
+        **({"category_search_profile": category_search_profile(category)}
+           if benchmark.is_locomo() else {}),
     }
 
 
@@ -95,9 +224,10 @@ def _compact_function(item: dict[str, Any]) -> dict[str, Any]:
 def _planner_fingerprint(system: str, user: str, bundle: dict, sample: dict, model: str) -> str:
     payload = {
         "policy": QUERY_POLICY_VERSION, "schema": PROGRAM_SCHEMA_VERSION,
+        "policy_sha256": policy_fingerprint(),
         "system": system, "user": user, "bundle": bundle,
         "conversation": sample.get("conversation", {}), "model": model,
-        "fallback": PROGRAM_TEMPLATE,
+        "fallback": prompts.PROGRAM_TEMPLATE, "dataset": benchmark.dataset_key(),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
@@ -111,6 +241,7 @@ def plan_and_execute(
     trace_dir: str | Path,
     candidates: dict[str, Any] | None = None,
     question_date: str = "",
+    category=None,
 ) -> dict[str, Any]:
     """Generate a complete constrained program and execute it safely."""
 
@@ -130,6 +261,7 @@ def plan_and_execute(
             question,
             llm,
             question_date=question_date,
+            category=category,
         )
     bundle = dict(candidates.get("retrieval_bundle", {}))
     write_json(bundle, trace_path / "retrieval_bundle.json")
@@ -152,16 +284,16 @@ def plan_and_execute(
             "candidate_functions": candidates.get("candidate_functions", []),
             "candidate_fact_ids": candidates.get("candidate_fact_ids", []),
             "query_policy": QUERY_POLICY_VERSION,
+            "category_search_profile": candidates.get("category_search_profile", {}),
         },
         trace_path / "planner_input.json",
     )
-    planner_system = PROGRAM_SYSTEM
-    user = (
-        PROGRAM_USER.replace("{{question}}", question)
-        .replace("{{functions}}", json.dumps(candidates.get("candidate_functions", []), ensure_ascii=False))
+    if category is None:
+        category = candidates.get("category_search_profile", {}).get("category") or bundle.get("question_context", {}).get("category")
+    planner_system, user = planner_prompts(
+        question, candidates.get("candidate_functions", []),
+        category=category, question_date=question_date,
     )
-    if question_date:
-        user += "\n\nQuestion date: " + question_date
     planner_fingerprint = _planner_fingerprint(
         planner_system, user, bundle, sample, str(getattr(llm, "model", ""))
     )
@@ -169,7 +301,7 @@ def plan_and_execute(
     prior_exhaustion = _read_prior_planner_exhaustion(trace_path, planner_fingerprint)
     if prior_exhaustion:
         # Only an exhausted attempt with identical current-policy inputs can
-        # resume directly through the category-independent fallback.
+        # resume directly through the dataset/category fallback.
         return _run_deterministic_fallback(
             attempts=prior_exhaustion,
             sample_memory_dir=sample_memory_dir,
@@ -221,7 +353,7 @@ def plan_and_execute(
                     candidates=candidates,
                     planner_fingerprint=planner_fingerprint,
                 )
-            instruction = user + PROGRAM_REPAIR_SUFFIX.replace("{{error}}", str(exc))
+            instruction = user + "\n\nYour previous program failed validation/execution:\n" + str(exc) + "\nRewrite the complete program."
     raise AssertionError("unreachable")
 
 
@@ -262,7 +394,7 @@ def _run_deterministic_fallback(
 ) -> dict[str, Any]:
     """Execute the fixed baseline instead of abstaining after planner failures."""
 
-    program = deterministic_retrieval_program() + "\n"
+    program = deterministic_retrieval_program(candidates.get("category_search_profile", {}).get("category")) + "\n"
     program_path = trace_path / "search_program_deterministic_fallback.py"
     program_path.write_text(program, encoding="utf-8")
     try:
@@ -305,6 +437,7 @@ def _run_deterministic_fallback(
             "used": True,
             "reason": "planner_generation_failed",
             "program_path": program_path.name,
+            "category_search_profile": candidates.get("category_search_profile", {}),
         },
         "attempts": attempts,
         "candidates": candidates,
@@ -336,6 +469,7 @@ def run_in_sandbox(
     write_json(
         {
             "program": program,
+            "dataset": benchmark.dataset_key(),
             "sample_memory_dir": str(sample_dir),
             "sample": sample,
             "retrieval_bundle": retrieval_bundle or {},

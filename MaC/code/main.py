@@ -18,7 +18,7 @@ from openai import APITimeoutError
 from tqdm import tqdm
 
 from . import llm_client
-from .benchmark import LM_CATEGORIES, LM_CATEGORY_NAMES
+from .benchmark import LM_CATEGORIES, LM_CATEGORY_NAMES, runtime_defaults
 from .config import Config, load_config
 from .cost_metrics import local_metric, merge_metrics, metric_is_complete, write_cost_reports
 from .data_loader import load_dataset
@@ -35,14 +35,17 @@ from .semantic_compiler import (
     emit_compiled_memory,
     replay_cached_semantic_cost,
     semantic_compiler_fingerprint,
+    semantic_batch_size,
 )
 from .qa_engine import prediction_key, prediction_fingerprint, read_completed_prediction_fingerprints, read_stage_metric_for_cost, run_qa_question, stage_checkpoint_path, stage_fingerprint_from_prediction
 from .utils import append_jsonl, ensure_dir, read_json, read_jsonl, write_json, write_jsonl
 from .prompt_contracts import FACT_TO_CODE_POLICY_VERSION, QUERY_POLICY_VERSION
+from .benchmark import policy_fingerprint
+from .retrieval_pipeline import retrieval_parameters
 
 
 MEMORY_BUILD_DONE_FILE = "build.done.json"
-MEMORY_BUILDER_VERSION = 14
+MEMORY_BUILDER_VERSION = 15
 DEFERRED_QUESTIONS_SCHEMA = "deferred_questions_v1"
 QUESTION_EXECUTION_STAGES = (
     "candidate_retrieval",
@@ -1399,6 +1402,7 @@ def _write_run_manifest(config: Config) -> None:
             "schema": "mac_run_config_v1",
             "fact_to_code_policy": FACT_TO_CODE_POLICY_VERSION,
             "query_policy": QUERY_POLICY_VERSION,
+            "policy_sha256": policy_fingerprint(),
             "llm_provider": config.llm_provider,
             "model": config.model,
             "dataset": config.dataset,
@@ -1406,6 +1410,21 @@ def _write_run_manifest(config: Config) -> None:
             "judge_model": config.judge_model,
             "candidate_reasoning": "disabled",
             "judge_reasoning": "disabled",
+            "parameters": {
+                "build_workers": config.build_max_workers,
+                "semantic_workers": config.semantic_max_workers,
+                "qa_workers": config.qa_max_workers,
+                "judge_workers": config.judge_max_workers,
+                "llm_max_concurrency": config.llm_max_concurrency,
+                "semantic_batch_size": semantic_batch_size(),
+                "semantic_request_timeout": config.semantic_request_timeout,
+                "semantic_api_max_retries": config.semantic_api_max_retries,
+                "retrieval": retrieval_parameters(),
+                "runtime": {
+                    name: os.getenv(name, value)
+                    for name, value in runtime_defaults(config.llm_provider).items()
+                },
+            },
             "gpt_transport": "official_openai_responses_api" if config.llm_provider == "gpt" else None,
         },
         Path(config.output_dir) / "run_config.json",
@@ -1510,10 +1529,8 @@ def main() -> None:
     # Retrieval helpers load the original dialogue file through DATA_PATH.
     # Keep that lookup aligned with any CLI or environment override above.
     os.environ["DATA_PATH"] = config.data_path
-    # DeepSeek's JSON output can truncate an 80-fact semantic batch. Keep the
-    # original dataset defaults for Qwen/GPT while using a safe DeepSeek size.
-    if config.llm_provider == "deepseek":
-        os.environ.setdefault("MAC_SEMANTIC_BATCH_SIZE", "40")
+    # Preserve the reference dataset defaults (LoCoMo 40, LongMemEval 80).
+    # MAC_SEMANTIC_BATCH_SIZE is an explicit user override, not a provider default.
 
     for field_name in (
         "build_max_workers",

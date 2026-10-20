@@ -95,8 +95,10 @@ Question: {question}
 Gold answer: {gold_answer}
 Generated answer: {generated_answer}
 
-Return only a JSON object with the key "label" and exactly one value: "CORRECT" or "WRONG".
-Do not include an explanation, Markdown, or both labels.
+First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
+Do NOT include both CORRECT and WRONG in your response, or it will break the evaluation script.
+
+Just return the label CORRECT or WRONG in a json format with the key as "label".
 """
 
 
@@ -215,7 +217,7 @@ def evaluate_predictions(
     logger.info("=" * 60)
     logger.info("Total prediction rows: %d", raw_prediction_count)
     logger.info("Excluded rows with unknown categories: %d", raw_prediction_count - len(preds))
-    logger.info("Total LongMemEval questions: %d", len(preds))
+    logger.info("Total evaluated questions: %d", len(preds))
 
     print("\n== F1 by category ==")
     per_category = {}
@@ -372,7 +374,7 @@ def _evaluate_with_llm_judge(
                 }
                 progress = tqdm(
                     as_completed(future_to_row),
-                    desc="LongMemEval LLM judge",
+                    desc="LLM judge",
                     unit="q",
                     initial=len(completed_rows),
                     total=len(completed_rows) + len(pending_rows),

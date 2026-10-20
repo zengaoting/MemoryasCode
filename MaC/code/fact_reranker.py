@@ -9,8 +9,8 @@ from .cost_metrics import lock_excluding_queue_wait
 
 
 DEFAULT_CROSS_ENCODER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
-DEFAULT_BATCH_SIZE = 32
-DEFAULT_MAX_LENGTH = 384
+DEFAULT_BATCH_SIZE = 8
+DEFAULT_MAX_LENGTH = 512
 _CROSS_ENCODER_LOAD_LOCK = threading.Lock()
 _CROSS_ENCODER_PREDICT_LOCK = threading.Lock()
 

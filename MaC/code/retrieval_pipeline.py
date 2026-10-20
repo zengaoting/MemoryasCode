@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import benchmark
 from .fact_reranker import rank_facts_with_cross_encoder
 from .llm_client import LLMClient
 from .prompts import (
@@ -31,10 +32,37 @@ HIGH_COVERAGE_CODE_PREFILTER_LIMIT = 768
 VIEW_EXPAND_LIMIT = 12
 VIEW_EXPAND_PREFILTER_LIMIT = 96
 KEYWORD_RECALL_LIMIT = 32
+GRAPH_SEED_LIMIT = 16
+GRAPH_EXPANSION_LIMIT = 96
+FINAL_FACT_LIMIT = 36
+HIGH_COVERAGE_FACT_LIMIT = 48
 SOURCE_FACT_LIMIT = 12
 SUPPLEMENTAL_SOURCE_FACT_LIMIT = 16
 HIGH_COVERAGE_SUPPLEMENTAL_SOURCE_FACT_LIMIT = 24
 SOURCE_WINDOW = 2
+RETRIEVAL_BUNDLE_SCHEMA = "mandatory_retrieval_bundle_v3"
+
+
+def retrieval_parameters() -> dict[str, int]:
+    """Report the effective reference limits for reproducible run manifests."""
+    return {
+        "code_recall": CODE_RECALL_LIMIT,
+        "code_prefilter": CODE_RECALL_PREFILTER_LIMIT,
+        "high_coverage_code_prefilter": (
+            CODE_RECALL_PREFILTER_LIMIT if benchmark.is_locomo() else HIGH_COVERAGE_CODE_PREFILTER_LIMIT
+        ),
+        "scope_expansion": 32 if benchmark.is_locomo() else VIEW_EXPAND_LIMIT,
+        "scope_prefilter": VIEW_EXPAND_PREFILTER_LIMIT,
+        "keyword_recall": KEYWORD_RECALL_LIMIT,
+        "source_fact_limit": SOURCE_FACT_LIMIT,
+        "supplemental_source_fact_limit": SUPPLEMENTAL_SOURCE_FACT_LIMIT,
+        "high_coverage_supplemental_source_fact_limit": (
+            SUPPLEMENTAL_SOURCE_FACT_LIMIT if benchmark.is_locomo()
+            else HIGH_COVERAGE_SUPPLEMENTAL_SOURCE_FACT_LIMIT
+        ),
+        "source_window": SOURCE_WINDOW,
+        "planner_candidates": 8,
+    }
 
 
 def prepare_retrieval_bundle(
@@ -43,6 +71,7 @@ def prepare_retrieval_bundle(
     question: str,
     llm: LLMClient,
     *,
+    category: str = "",
     question_date: str = "",
 ) -> dict[str, Any]:
     """Build the base evidence routes for one question.
@@ -51,13 +80,15 @@ def prepare_retrieval_bundle(
     Scope expansion starts from selected code functions. Graph traversal is
     deferred to ``memory.expand_relation()`` when a generated program needs it.
     """
+    if benchmark.is_locomo():
+        return _locomo_prepare_retrieval_bundle(sample_memory_dir, sample, question, llm)
 
     sample_dir = Path(sample_memory_dir)
     facts_by_id = _canonical_facts(sample_dir)
     function_index = _function_index(sample_dir)
     view_index = _view_index(sample_dir)
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="code-recall") as pool:
-        code_future = pool.submit(_code_recall, question, function_index)
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mac-recall") as pool:
+        code_future = pool.submit(_code_recall, question, function_index, category)
         terms = extract_retrieval_terms(question, llm)
         code_candidates, code_metadata = code_future.result()
     keyword_matches = keyword_recall_facts(facts_by_id, terms, limit=KEYWORD_RECALL_LIMIT)
@@ -80,7 +111,7 @@ def prepare_retrieval_bundle(
     base_facts = [facts_by_id[fact_id] for fact_id in merged_fact_ids if fact_id in facts_by_id]
     context = build_source_context(
         sample, base_facts, question=question, terms=terms,
-        question_date=question_date,
+        category=category, question_date=question_date,
     )
 
     origins = {}
@@ -91,9 +122,9 @@ def prepare_retrieval_bundle(
             "keyword_recall": fact_id in set(keyword_fact_ids),
         }
     return {
-        "schema": "query_bundle_v5",
+        "schema": "query_bundle_v4",
         "question": question,
-        "question_context": {"question_date": question_date},
+        "question_context": {"category": category, "question_date": question_date},
         "resolve": {
             "candidate_functions": code_candidates,
             "function_ids": [str(item.get("id", "")) for item in code_candidates],
@@ -163,6 +194,8 @@ def build_answer_context(
     canonical_facts_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Render answer context from the program-hydrated evidence when present."""
+    if benchmark.is_locomo():
+        return _locomo_build_answer_context(bundle, program_result, program_trace=program_trace, canonical_facts_by_id=canonical_facts_by_id)
 
     final = bundle.get("final", {}) if isinstance(bundle, dict) else {}
     facts = list(final.get("facts", [])) if isinstance(final, dict) else []
@@ -191,9 +224,10 @@ def build_answer_context(
     temporal_computations = list(context.get("temporal_computations", [])) if isinstance(context, dict) else []
     lines: list[str] = []
     question_context = bundle.get("question_context", {}) if isinstance(bundle, dict) else {}
-    if isinstance(question_context, dict) and question_context.get("question_date"):
+    if isinstance(question_context, dict) and any(question_context.values()):
         lines.extend([
             "# Question Context", "",
+            f"- category: {question_context.get('category', '')}",
             f"- question_date: {question_context.get('question_date', '')}",
             "- question_date is the temporal cutoff for current/latest-state questions.",
             "",
@@ -300,9 +334,11 @@ def _view_index(sample_dir: Path) -> list[dict[str, Any]]:
     return views
 
 
-def _code_recall(question: str, functions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _code_recall(question: str, functions: list[dict[str, Any]], category: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if benchmark.is_locomo():
+        return _locomo_code_recall(question, functions)
     retrieval_question = _expanded_retrieval_query(question)
-    prefilter_limit = HIGH_COVERAGE_CODE_PREFILTER_LIMIT if _needs_high_coverage(question) else CODE_RECALL_PREFILTER_LIMIT
+    prefilter_limit = HIGH_COVERAGE_CODE_PREFILTER_LIMIT if _needs_high_coverage(question, category) else CODE_RECALL_PREFILTER_LIMIT
     lexical = _rank_records(retrieval_question, functions, limit=prefilter_limit)
     projected = []
     for item in lexical:
@@ -369,7 +405,7 @@ def _view_expand_candidates(
     reranked, metadata = rank_facts_with_cross_encoder(question, projected)
     lookup = {str(item.get("id", "")): item for item in lexical}
     selected: list[dict[str, Any]] = []
-    for scored in reranked[:VIEW_EXPAND_LIMIT]:
+    for scored in reranked[:(32 if benchmark.is_locomo() else VIEW_EXPAND_LIMIT)]:
         function_id = str(scored.get("fact_id", ""))
         record = lookup.get(function_id)
         if record:
@@ -454,6 +490,12 @@ def _materialise_code_candidates(
     return _dedupe_ids(fact_ids), execution
 
 
+
+
+
+
+
+
 def _rank_records(question: str, records: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
     question_tokens = _tokens(question)
     scored = []
@@ -468,11 +510,14 @@ def _rank_records(question: str, records: list[dict[str, Any]], *, limit: int) -
 
 
 def build_source_context(
-    sample: dict[str, Any], ranked_facts: list[dict[str, Any]], *, question: str = "", terms: dict[str, Any] | None = None, question_date: str = "",
+    sample: dict[str, Any], ranked_facts: list[dict[str, Any]], *, question: str = "", terms: dict[str, Any] | None = None, category: str = "", question_date: str = "",
 ) -> dict[str, Any]:
+    if benchmark.is_locomo():
+        return _locomo_build_source_context(sample, ranked_facts, question=question, terms=terms)
     source_index = _source_dialogue_index(sample)
     anchor_facts = _select_source_anchors(
         ranked_facts, question, _normalise_terms(terms or {}), source_index,
+        category=category,
     )
     lines, dialogue_ids = [], []
     seen: set[str] = set()
@@ -523,6 +568,8 @@ def _temporal_computations(
     *,
     question_date: str = "",
 ) -> list[dict[str, Any]]:
+    if benchmark.is_locomo():
+        return _locomo_temporal_computations(question, anchor_facts, source_index)
     computations = _relative_time_from_question_date(
         question, anchor_facts, source_index, question_date
     )
@@ -711,6 +758,8 @@ def _plan_followup_time_intersection(question: str, anchor_facts: list[dict[str,
 
 
 def _parse_session_datetime(value: Any) -> datetime | None:
+    if benchmark.is_locomo():
+        return _locomo_parse_session_datetime(value)
     text = str(value or "").strip()
     iso_like = re.search(r"\b(\d{4})/(\d{1,2})/(\d{1,2})(?:\s+\([A-Za-z]{3}\))?(?:\s+\d{1,2}:\d{2})?", text)
     if iso_like:
@@ -733,18 +782,22 @@ def _parse_session_datetime(value: Any) -> datetime | None:
         return None
 
 
-def _needs_high_coverage(question: str) -> bool:
+def _needs_high_coverage(question: str, category: str = "") -> bool:
+    if benchmark.is_locomo():
+        return _locomo_needs_high_coverage(question)
     text = str(question or "")
     hard_form = bool(re.search(r"\b(?:when|how long|how many|what date|what year|what month|which|what (?:are|were|kinds|types|places|items|books|games|hobbies|skills|ways))\b", text, re.I))
     explicit_period = bool(re.search(r"\b(?:(?:19|20)\d{2}|january|february|march|april|may|june|july|august|september|october|november|december)\b", text, re.I))
-    return hard_form or explicit_period
+    return str(category) in {"multi-session", "temporal-reasoning", "knowledge-update"} or hard_form or explicit_period
 
 
 def _select_source_anchors(
-    ranked_facts: list[dict[str, Any]], question: str, terms: dict[str, Any], source_index: dict[tuple[int, int], dict[str, Any]],
+    ranked_facts: list[dict[str, Any]], question: str, terms: dict[str, Any], source_index: dict[tuple[int, int], dict[str, Any]], *, category: str = "",
 ) -> list[dict[str, Any]]:
+    if benchmark.is_locomo():
+        return _locomo_select_source_anchors(ranked_facts, question, terms, source_index)
     base = list(ranked_facts[:SOURCE_FACT_LIMIT])
-    if not _needs_high_coverage(question):
+    if not _needs_high_coverage(question, category):
         return base
     explicit_years = set(re.findall(r"\b(?:19|20)\d{2}\b", question))
     month_names = "january|february|march|april|may|june|july|august|september|october|november|december"
@@ -777,7 +830,7 @@ def _select_source_anchors(
         if fact_id not in seen:
             base.append(fact)
             seen.add(fact_id)
-        supplemental_limit = HIGH_COVERAGE_SUPPLEMENTAL_SOURCE_FACT_LIMIT if _needs_high_coverage(question) else SUPPLEMENTAL_SOURCE_FACT_LIMIT
+        supplemental_limit = HIGH_COVERAGE_SUPPLEMENTAL_SOURCE_FACT_LIMIT if _needs_high_coverage(question, category) else SUPPLEMENTAL_SOURCE_FACT_LIMIT
         if len(base) >= SOURCE_FACT_LIMIT + supplemental_limit:
             break
     return base
@@ -837,6 +890,12 @@ def _augment_terms_for_question(question: str, terms: dict[str, Any]) -> dict[st
         *_deterministic_query_expansions(question),
     ])
     return augmented
+
+
+
+
+
+
 
 
 def _normalise_terms(raw: Any) -> dict[str, Any]:
@@ -927,3 +986,302 @@ def _dedupe_ids(values: Any) -> list[str]:
             out.append(item)
             seen.add(item)
     return out
+
+
+# LoCoMo source behavior differs in evidence fallback and temporal context.
+
+def _locomo_prepare_retrieval_bundle(
+    sample_memory_dir: str | Path,
+    sample: dict[str, Any],
+    question: str,
+    llm: LLMClient,
+) -> dict[str, Any]:
+    """Build the mandatory evidence bundle for one question.
+
+    Code recall and LLM keyword-term extraction deliberately begin in parallel.
+    View expansion starts from the selected code functions, then all later
+    ranking works on canonical facts from ``facts_by_id.json``.
+    """
+
+    sample_dir = Path(sample_memory_dir)
+    facts_by_id = _canonical_facts(sample_dir)
+    function_index = _function_index(sample_dir)
+    view_index = _view_index(sample_dir)
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mac-recall") as pool:
+        code_future = pool.submit(_code_recall, question, function_index)
+        terms_future = pool.submit(extract_retrieval_terms, question, llm)
+        code_candidates, code_metadata = code_future.result()
+        terms = terms_future.result()
+    keyword_matches = keyword_recall_facts(facts_by_id, terms, limit=KEYWORD_RECALL_LIMIT)
+
+    code_fact_ids, code_execution = _materialise_code_candidates(
+        sample_dir, sample, code_candidates, facts_by_id
+    )
+    view_candidates, view_metadata = _view_expand_candidates(
+        question,
+        code_candidates,
+        function_index,
+        view_index,
+        facts_by_id,
+    )
+    view_fact_ids, view_execution = _materialise_code_candidates(
+        sample_dir, sample, view_candidates, facts_by_id
+    )
+    keyword_fact_ids = _dedupe_ids(item["fact_id"] for item in keyword_matches)
+    merged_fact_ids = _dedupe_ids(code_fact_ids + view_fact_ids + keyword_fact_ids)
+    # Graph traversal is now an explicit program operator, not an unconditional
+    # precomputed retrieval branch.
+    base_facts = [facts_by_id[fact_id] for fact_id in merged_fact_ids if fact_id in facts_by_id]
+
+    origins = {}
+    for fact_id in merged_fact_ids:
+        origins[fact_id] = {
+            "code_recall": fact_id in set(code_fact_ids),
+            "view_expand": fact_id in set(view_fact_ids),
+            "keyword_recall": fact_id in set(keyword_fact_ids),
+        }
+    return {
+        "schema": "query_bundle_v4",
+        "question": question,
+        "resolve": {
+            "candidate_functions": code_candidates,
+            "function_ids": [str(item.get("id", "")) for item in code_candidates],
+            "fact_ids": code_fact_ids,
+            "metadata": code_metadata,
+            "execution": code_execution,
+        },
+        "expand_scope": {
+            "seed_function_ids": [str(item.get("id", "")) for item in code_candidates],
+            "view_entrypoints": list(view_metadata.get("matched_view_entrypoints", [])),
+            "candidate_function_ids": list(view_metadata.get("eligible_function_ids", [])),
+            "candidate_functions": view_candidates,
+            "function_ids": [str(item.get("id", "")) for item in view_candidates],
+            "fact_ids": view_fact_ids,
+            "metadata": view_metadata,
+            "execution": view_execution,
+        },
+        "match": {
+            "terms": terms,
+            "matches": keyword_matches,
+            "fact_ids": keyword_fact_ids,
+        },
+        "base": {"fact_ids": merged_fact_ids, "origins": origins},
+        "final": {
+            "fact_ids": merged_fact_ids,
+            "facts": base_facts,
+            "ranking": {"strategy": "base_resolve_scope_match_only"},
+        },
+        "context": {"question": question},
+    }
+
+def _locomo_build_answer_context(
+    bundle: dict[str, Any],
+    program_result: dict[str, Any] | list[dict[str, Any]] | None = None,
+    *,
+    program_trace: dict[str, Any] | None = None,
+    canonical_facts_by_id: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Render MAC-compatible raw evidence plus non-authoritative program provenance.
+
+    Program outputs can be intentionally narrow (for example a count or a time
+    filter).  The answer model therefore receives raw facts and dialogue lines
+    as its only answer-bearing evidence; executable-search output is reduced to
+    stable provenance and operation names.
+    """
+
+    runtime_context = (
+        program_result.get("value", {})
+        if isinstance(program_result, dict) and isinstance(program_result.get("value"), dict)
+        else {}
+    )
+    final = bundle.get("final", {}) if isinstance(bundle, dict) else {}
+    context = bundle.get("context", {}) if isinstance(bundle, dict) else {}
+    hydrated_facts = list(runtime_context.get("facts", []))
+    hydrated_sources = list(runtime_context.get("source_lines", []))
+    facts = hydrated_facts if hydrated_facts else list(final.get("facts", [])) if isinstance(final, dict) else []
+    source_lines = hydrated_sources if hydrated_sources else list(context.get("source_lines", [])) if isinstance(context, dict) else []
+    program_source_lines = [] if hydrated_sources else list(runtime_context.get("program_source_lines", []))
+    program_facts = [] if hydrated_facts else list(runtime_context.get("program_facts", []))
+    if not hydrated_facts and isinstance(canonical_facts_by_id, dict):
+        known_ids = {str(item.get("fact_id", "")) for item in [*facts, *program_facts] if isinstance(item, dict)}
+        for fact_id in _program_result_provenance(program_result).get("fact_ids", []):
+            fact = canonical_facts_by_id.get(str(fact_id))
+            if isinstance(fact, dict) and str(fact_id) not in known_ids:
+                program_facts.append(dict(fact))
+                known_ids.add(str(fact_id))
+    temporal_computations = list(context.get("temporal_computations", [])) if isinstance(context, dict) else []
+    lines: list[str] = []
+    if source_lines:
+        lines.extend([
+            "# Original Dialogue Evidence Near Top-Ranked Facts", "",
+            "Use original lines when their person, date, event, and requested attribute match the question.",
+            "",
+            *source_lines,
+        ])
+    lines.extend(["", "# Deduplicated Raw Facts", ""])
+    lines.extend(format_fact_line(fact) for fact in facts)
+    if temporal_computations:
+        lines.extend(["", "# Deterministic Temporal Calculations", "", "These values are computed from the cited session timestamps; use them only when the question requests that operation.", json.dumps(temporal_computations, ensure_ascii=False, indent=2)])
+    if program_facts:
+        lines.extend(["", "# Program-Selected Supplemental Raw Facts", "", "These facts were selected by question-specific executable operations and supplement the fixed recall result.", "", *(format_fact_line(fact) for fact in program_facts)])
+    if program_source_lines:
+        lines.extend(["", "# Original Dialogue for Program-Selected Facts", "", *program_source_lines])
+    trace = _answer_safe_program_trace(program_result, program_trace)
+    if trace:
+        lines.extend([
+            "",
+            "# Executed Search Trace (Non-authoritative)",
+            "",
+            "This trace records how evidence was located. It is not an additional fact and must not override the original dialogue or raw facts above.",
+            json.dumps(trace, ensure_ascii=False, indent=2),
+        ])
+    return "\n".join(lines)
+
+def _locomo_code_recall(question: str, functions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    retrieval_question = _expanded_retrieval_query(question)
+    lexical = _rank_records(retrieval_question, functions, limit=CODE_RECALL_PREFILTER_LIMIT)
+    projected = []
+    for item in lexical:
+        projected.append({
+            "fact_id": str(item.get("id", "")),
+            "fact_text": str(item.get("search") or ""),
+            "speaker": str(item.get("subject", "")),
+            "subject": str(item.get("subject", "")),
+            "topics": [str(item.get("predicate") or ""), str(item.get("operation") or "")],
+            "normalized_time": "",
+            "dialogue_ids": [],
+        })
+    reranked, metadata = rank_facts_with_cross_encoder(retrieval_question, projected)
+    lookup = {str(item.get("id", "")): item for item in lexical}
+    selected = []
+    for scored in reranked[:CODE_RECALL_LIMIT]:
+        item = dict(lookup.get(str(scored.get("fact_id", "")), {}))
+        if item:
+            item["_cross_encoder_score"] = scored.get("_cross_encoder_score")
+            selected.append(item)
+    metadata["strategy"] = "function_index_lexical_cross_encoder_v1"
+    metadata["lexical_prefilter_count"] = len(lexical)
+    metadata["query_expansions"] = _deterministic_query_expansions(question)
+    return selected, metadata
+
+def _locomo_build_source_context(
+    sample: dict[str, Any], ranked_facts: list[dict[str, Any]], *, question: str = "", terms: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_index = _source_dialogue_index(sample)
+    anchor_facts = _select_source_anchors(ranked_facts, question, _normalise_terms(terms or {}), source_index)
+    lines, dialogue_ids = [], []
+    seen: set[str] = set()
+    rank_by_id = {str(fact.get("fact_id", "")): rank for rank, fact in enumerate(ranked_facts, start=1)}
+    for fact in anchor_facts:
+        fact_rank = rank_by_id.get(str(fact.get("fact_id", "")), 0)
+        for raw_id in fact.get("dialogue_ids") or [fact.get("dia_id", "")]:
+            parsed = _parse_dialogue_id(raw_id)
+            if parsed is None:
+                continue
+            session, turn = parsed
+            for neighbor in range(max(1, turn - SOURCE_WINDOW), turn + SOURCE_WINDOW + 1):
+                source = source_index.get((session, neighbor))
+                if not source:
+                    continue
+                dia_id = str(source.get("dia_id") or f"D{session}:{neighbor}")
+                if dia_id in seen:
+                    continue
+                seen.add(dia_id)
+                dialogue_ids.append(dia_id)
+                text = re.sub(r"\s+", " ", str(source.get("text") or "")).strip()
+                details = text or "(non-text message)"
+                session_date = str(source.get("session_datetime") or "").strip()
+                date_note = f" | session_datetime={session_date}" if session_date else ""
+                visual = "; ".join(value for value in (str(source.get("blip_caption") or "").strip(), str(source.get("query") or "").strip()) if value)
+                visual_note = f" | visual={visual}" if visual else ""
+                lines.append(
+                    f"- [{dia_id} | rank={fact_rank} | neighbor={neighbor - turn:+d}{date_note}{visual_note} | "
+                    f"{source.get('speaker') or 'unknown'}] {details}"
+                )
+    return {
+        "source_lines": lines,
+        "dialogue_ids": dialogue_ids,
+        "anchor_fact_ids": [str(item.get("fact_id", "")) for item in anchor_facts],
+        "window": SOURCE_WINDOW,
+        "estimated_tokens": estimate_text_tokens("\n".join(lines)),
+        "temporal_computations": _temporal_computations(question, anchor_facts, source_index),
+    }
+
+def _locomo_temporal_computations(question: str, anchor_facts: list[dict[str, Any]], source_index: dict[tuple[int, int], dict[str, Any]]) -> list[dict[str, Any]]:
+    computations = _direct_recent_onset_time(question, anchor_facts, source_index)
+    if not re.search(r"\bafter how many weeks\b", question, re.I):
+        return [*computations, *_plan_followup_time_intersection(question, anchor_facts, source_index)]
+    points = []
+    seen_dates: set[datetime] = set()
+    for fact in anchor_facts:
+        for raw_id in fact.get("dialogue_ids") or [fact.get("dia_id", "")]:
+            parsed = _parse_dialogue_id(raw_id)
+            source = source_index.get(parsed) if parsed else None
+            date = _parse_session_datetime(source.get("session_datetime")) if source else None
+            if date and date not in seen_dates:
+                points.append((date, str(raw_id), str(fact.get("fact_id", ""))))
+                seen_dates.add(date)
+                break
+        if len(points) >= 2:
+            break
+    if len(points) < 2:
+        return [*computations, *_plan_followup_time_intersection(question, anchor_facts, source_index)]
+    start, end = sorted(points, key=lambda item: item[0])
+    elapsed_days = (end[0] - start[0]).days
+    return [*computations, {"operation": "elapsed_whole_weeks_between_reporting_sessions", "from": start[0].date().isoformat(), "to": end[0].date().isoformat(), "elapsed_days": elapsed_days, "whole_weeks": elapsed_days // 7, "answer_text": f"{elapsed_days // 7} weeks", "support_dialogue_ids": [start[1], end[1]], "support_fact_ids": [start[2], end[2]]}, *_plan_followup_time_intersection(question, anchor_facts, source_index)]
+
+def _locomo_parse_session_datetime(value: Any) -> datetime | None:
+    match = re.search(r"\bon\s+(\d{1,2}\s+[A-Za-z]+,\s+\d{4})\s*$", str(value or "").strip(), re.I)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%d %B, %Y")
+    except ValueError:
+        return None
+
+def _locomo_needs_high_coverage(question: str) -> bool:
+    text = str(question or "")
+    hard_form = bool(re.search(r"\b(?:when|how long|how many|what date|what year|what month|which|what (?:are|were|kinds|types|places|items|books|games|hobbies|skills|ways))\b", text, re.I))
+    explicit_period = bool(re.search(r"\b(?:(?:19|20)\d{2}|january|february|march|april|may|june|july|august|september|october|november|december)\b", text, re.I))
+    return hard_form or explicit_period
+
+def _locomo_select_source_anchors(
+    ranked_facts: list[dict[str, Any]], question: str, terms: dict[str, Any], source_index: dict[tuple[int, int], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    base = list(ranked_facts[:SOURCE_FACT_LIMIT])
+    if not _needs_high_coverage(question):
+        return base
+    explicit_years = set(re.findall(r"\b(?:19|20)\d{2}\b", question))
+    month_names = "january|february|march|april|may|june|july|august|september|october|november|december"
+    explicit_months = set(re.findall(rf"\b(?:{month_names})\b", question.lower()))
+    temporal = bool(re.search(r"\b(?:when|how long|week|month|year|date|before|after|during|since|as of)\b", question, re.I))
+    exhaustive = bool(re.search(r"\b(?:how many|which|what (?:are|were|kinds|types|places|items|books|games|hobbies|skills|ways))\b", question, re.I))
+    scored = []
+    for rank, fact in enumerate(ranked_facts[SOURCE_FACT_LIMIT:], start=SOURCE_FACT_LIMIT + 1):
+        score, _ = _score_fact_for_terms(fact, terms)
+        source_times = []
+        for raw_id in fact.get("dialogue_ids") or [fact.get("dia_id", "")]:
+            parsed = _parse_dialogue_id(raw_id)
+            if parsed and parsed in source_index:
+                source_times.append(str(source_index[parsed].get("session_datetime") or ""))
+        combined_time = " ".join([str(fact.get("normalized_time") or ""), *source_times]).lower()
+        if temporal:
+            score += 1.0 if combined_time.strip() else 0.0
+            if explicit_years:
+                score += 8.0 if any(year in combined_time for year in explicit_years) else -4.0
+            if explicit_months:
+                score += 8.0 if any(month in combined_time for month in explicit_months) else -4.0
+        if exhaustive:
+            score += max(0.0, 2.0 - rank / 100.0)
+        if score > 0:
+            scored.append((score, rank, fact))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    seen = {str(fact.get("fact_id", "")) for fact in base}
+    for _, _, fact in scored:
+        fact_id = str(fact.get("fact_id", ""))
+        if fact_id not in seen:
+            base.append(fact)
+            seen.add(fact_id)
+        if len(base) >= SOURCE_FACT_LIMIT + SUPPLEMENTAL_SOURCE_FACT_LIMIT:
+            break
+    return base

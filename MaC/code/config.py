@@ -6,7 +6,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .benchmark import set_dataset
+from .benchmark import runtime_defaults, set_dataset
 
 
 PROVIDERS = ("qwen", "deepseek", "gpt")
@@ -25,13 +25,13 @@ class Config:
     output_dir: str
     llm_provider: str = "qwen"
     dataset: str = "longmemeval"
-    build_max_workers: int = 10
+    build_max_workers: int = 4
     semantic_max_workers: int = 4
     semantic_request_timeout: float = 300.0
     semantic_api_max_retries: int = 1
-    qa_max_workers: int = 10
-    judge_max_workers: int = 10
-    llm_max_concurrency: int = 10
+    qa_max_workers: int = 4
+    judge_max_workers: int = 12
+    llm_max_concurrency: int = 4
     max_samples: int | None = None
     samples_per_category: int | None = None
     max_questions_per_sample: int | None = None
@@ -64,6 +64,14 @@ def _positive_float_env(name: str, default: float) -> float:
     return value
 
 
+def _worker_setting(name: str, default: int) -> int:
+    """Current MAC_* settings take precedence over reference OUR_V1_* names."""
+    current = "MAC_" + name
+    legacy = "OUR_V1_" + name
+    selected = current if os.getenv(current, "").strip() else legacy
+    return _positive_int_env(selected, default)
+
+
 def _provider_settings(provider: str) -> tuple[str, str, str]:
     if provider == "qwen":
         return os.getenv("QWEN_API_KEY", ""), os.getenv("QWEN_BASE_URL", "https://api.openai.com/v1"), os.getenv("QWEN_MODEL", "qwen3.6-27b-awq2")
@@ -83,6 +91,8 @@ def load_config(*, provider: str = "qwen", dataset: str = "longmemeval", model: 
         raise ValueError(f"--dataset must be one of: {', '.join(DATASETS)}")
     load_dotenv(".env")
     set_dataset(dataset)
+    for name, value in runtime_defaults(provider).items():
+        os.environ.setdefault(name, value)
     api_key, base_url, default_model = _provider_settings(provider)
     selected_model = str(model or default_model).strip()
     if not selected_model:
@@ -95,13 +105,17 @@ def load_config(*, provider: str = "qwen", dataset: str = "longmemeval", model: 
         judge_model=os.getenv("JUDGE_MODEL") or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         data_path=os.getenv("DATA_PATH", str(Path("data") / data_name)),
         output_dir=os.getenv("OUTPUT_DIR", str(Path("outputs") / dataset / provider)),
-        build_max_workers=_positive_int_env("MAC_BUILD_MAX_WORKERS", 10),
-        semantic_max_workers=_positive_int_env("MAC_SEMANTIC_MAX_WORKERS", 4),
-        semantic_request_timeout=_positive_float_env("SEMANTIC_REQUEST_TIMEOUT", 300.0),
-        semantic_api_max_retries=_positive_int_env("SEMANTIC_API_MAX_RETRIES", 1),
-        qa_max_workers=_positive_int_env("MAC_QA_MAX_WORKERS", 10),
-        judge_max_workers=_positive_int_env("MAC_JUDGE_MAX_WORKERS", 10),
-        llm_max_concurrency=_positive_int_env("MAC_LLM_MAX_CONCURRENCY", 10),
+        build_max_workers=_worker_setting("BUILD_MAX_WORKERS", 4),
+        semantic_max_workers=_worker_setting("SEMANTIC_MAX_WORKERS", 4),
+        semantic_request_timeout=_positive_float_env(
+            "SEMANTIC_REQUEST_TIMEOUT", 900.0 if dataset == "locomo" else 300.0
+        ),
+        semantic_api_max_retries=_positive_int_env(
+            "SEMANTIC_API_MAX_RETRIES", 3 if dataset == "locomo" else 1
+        ),
+        qa_max_workers=_worker_setting("QA_MAX_WORKERS", 4),
+        judge_max_workers=_worker_setting("JUDGE_MAX_WORKERS", 12),
+        llm_max_concurrency=_worker_setting("LLM_MAX_CONCURRENCY", 4),
         max_samples=_optional_positive_int_env("MAX_SAMPLES"),
         samples_per_category=_optional_positive_int_env("SAMPLES_PER_CATEGORY"),
         max_questions_per_sample=_optional_positive_int_env("MAX_QUESTIONS_PER_SAMPLE"),

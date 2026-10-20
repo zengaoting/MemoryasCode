@@ -14,6 +14,7 @@ from .executable_memory import MemorySDK
 from .memory_runtime import Evidence, MemoryValue
 from .program_language import validate_program
 from .utils import write_json
+from .benchmark import set_dataset
 
 
 def _limit_resources(memory_limit_mb: int, cpu_limit_seconds: int) -> None:
@@ -47,6 +48,7 @@ class _TracingMemory:
 
 
 def execute_request(request: dict[str, Any]) -> dict[str, Any]:
+    set_dataset(str(request["dataset"]))
     _limit_resources(int(request["memory_limit_mb"]), int(request["cpu_limit_seconds"]))
     program = str(request["program"])
     tree = validate_program(program)

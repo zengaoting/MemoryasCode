@@ -19,59 +19,89 @@ The framework is illustrated below.
 
 The design provides reusable memory computations, complete one-plan retrieval instead of repeated stepwise planning, and per-question execution traces containing generated programs, validation outcomes, repair attempts, fact IDs, and source references.
 
-### Paper-aligned prompts and label-free generation
+### Dataset-specific MaC2 reference behavior
 
-The two appendix prompt cores are shared in `code/prompt_contracts.py`, with
-references in [Fact to Code](prompts/fact_to_code.md) and
-[Declarative Query Planning](prompts/declarative_query_planning.md). Runtime
-prompts append only the JSON output schema or read-only SDK interface contract.
+This revision restores the active policies from two saved reference projects:
 
-Benchmark question categories are retained for sample selection, prediction
-metadata, and grouped evaluation only. They are not passed to retrieval,
-planning, or answer generation, and do not choose a retrieval skeleton or
-answer instruction. Questions, source dialogue, and available dates are still
-used. General human-designed guidance is identical across questions; the
-planner determines the required operations. The fixed multi-route program is
-reserved for exhausted planning/repair failures and is not shown as the normal
-planning template. Answer audits use question wording and the draft, without
-an extra category-classification model call.
+- LoCoMo: `/home/yuxin/MaC/locomo/deepseek/MaC2`.
+- LongMemEval: `/home/yuxin/MaC/lm/qwen/MaC2`.
 
-This revision changes the experimental condition. Historical scores obtained
-with category-guided prompts must not be presented as scores for this revision
-without a new evaluation. QA cache version 32 and planner version 11 invalidate
-old generation checkpoints. Build version 14 and the fact-to-code policy tag
-prevent old semantic prompts from being silently reused, even with the legacy
-ignore-configuration option. Matching raw fact-extraction caches can still be
-reused. Old planning-failure traces cannot bypass the new planner; matching
-current-policy traces remain resumable. Existing experiment outputs are not
-migrated or deleted by this code update. Use a new `--output` directory when
-rerunning to preserve historical artifacts.
+LoCoMo uses its benchmark category to choose planner guidance and a recommended
+retrieval skeleton. Multi-hop and open-domain questions recommend concept/session
+expansion; temporal questions recommend session expansion; single-hop questions
+recommend the direct code/lexical union without scope expansion. These are
+recommendations, not mandatory program steps. The deterministic fallback uses
+the same category-specific skeleton after exhausted planning/repair attempts.
 
-Generated fact files retain the matching Python function name
-(`memory_code/facts/<function_name>.py`). Overlong names use a readable prefix
-plus a stable hash, bounded to 180 ASCII characters; short names and factual
-content remain unchanged. Imports and indexes use the same final names. Long
-view-file labels receive the same path-length protection. Build completion records check
-the code-layout version; rerunning an older layout regenerates local code and
-indexes while reusing compatible extraction and semantic checkpoints.
+LongMemEval uses the reference SDK call card and common recommended skeleton,
+plus guidance for its six categories and the question date. Both datasets retain
+the reference category-specific answer instructions and audit triggers. Category
+labels are intentional model inputs in this revision. Gold answers and annotated
+gold evidence remain outside generation and are used for evaluation only.
 
-Offline checks (no paid API calls or model downloads):
+Dataset-specific planning and answer prompts live in `code/prompts.py`.
+`code/program_executor.py` selects planner guidance and retrieval skeletons;
+`code/qa_engine.py` applies answer instructions, repairs, and audits. Dataset
+selection, category normalization, and policy fingerprints live in
+`code/benchmark.py`. The reference projects are listed above; the integrated
+runtime does not depend on them. Shared semantic compiler prompts remain in
+`code/prompt_contracts.py`. The Markdown files in
+`prompts/` document the runtime prompts; editing Markdown does not alter execution.
+The Judge wording also matches the reference evaluators rather than the previous
+label-only rewrite.
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
-```
+The defaults below match the non-secret settings in the reference projects'
+`.env` files, including their launcher settings:
 
-The `prompts/` directory contains only the two paper-appendix prompt references:
-[Fact to Code](prompts/fact_to_code.md) and
-[Declarative Query Planning](prompts/declarative_query_planning.md).
-Other runtime prompts remain defined in the Python implementation. Editing
-Markdown alone does not change runtime prompts. The current planner policy is
-`category_free_v2`; it retains the paper's core wording and makes the supported
-conditional syntax explicit. Malformed optional answer checks are retried at
-most twice for schema errors, then rejected in favor of the existing draft.
-The Judge now consistently requests label-only JSON; historical Judge results
-are not silently reused across this evaluation-policy revision.
+| Parameter | LoCoMo | LongMemEval |
+| --- | ---: | ---: |
+| Memory extraction / semantic workers | 4 / 4 | 4 / 4 |
+| Session extraction workers per sample | 2 | 2 |
+| QA / Judge workers | 4 / 12 | 4 / 12 |
+| Global concurrent API requests | 4 | 4 |
+| Maximum extracted facts per session | 64 | 64 |
+| Semantic batch size | 40 | 80 |
+| Semantic request timeout / API attempts | 900 s / 3 | 300 s / 1 |
+| DeepSeek or Qwen request timeout / API attempts | 900 s / 3 | 900 s / 3 |
+| Cross-Encoder batch size / max length | 8 / 512 | 8 / 512 |
+| Code recall / lexical prefilter | 24 / 320 | 24 / 320 (768 for high coverage) |
+| Scope expansion / expansion prefilter | 32 / 96 | 12 / 96 |
+| Keyword recall / source window | 32 / 2 | 32 / 2 |
+| Sandbox wall / CPU / memory limit | 5 s / 5 s / 512 MiB | 5 s / 5 s / 512 MiB |
 
+The reranker is `Qwen/Qwen3-Reranker-0.6B`, loaded from local files by default.
+CUDA defaults to GPU 0, expandable allocation segments are enabled, and tokenizer
+parallelism is disabled. Existing process or `.env` settings take precedence over
+these defaults. `MAC_*` worker settings take precedence over equivalent reference
+`OUR_V1_*` settings; explicit CLI worker arguments take precedence over both.
+`MAC_SEMANTIC_BATCH_SIZE` explicitly overrides the dataset batch size. In
+particular, DeepSeek no longer silently changes LongMemEval's batch size to 40.
+Model names and credentials remain provider configuration, independent of the
+benchmark strategy. An explicitly configured model is not changed by migration.
+
+The newer staged construction pools, per-batch resume checkpoints, atomic writes,
+and bounded generated filenames are retained. QA checkpoint version 33, planner
+version 12, build version 15, and reference-policy fingerprints prevent old
+category-free generated artifacts from being silently reused. Use a new output
+directory for a new experiment; historical result files are not migrated.
+
+Moving the dataset policies into these existing modules preserves the prompt
+text and runtime parameters. The integrated policy fingerprint covers the prompt,
+planner, answer, and dataset modules, so QA/planner checkpoints created before
+this reorganization are invalidated. Compatible memory-construction caches can
+still be reused.
+
+`run_config.json` records the effective worker counts, runtime parameters,
+semantic batch size, dataset, model and policy digest without credentials.
+Reference code/behavior alignment does not imply that a fresh API run will
+reproduce historical scores or the five-round Judge mean and standard deviation.
+
+Offline validation uses fixed model responses, with no API calls or model
+downloads. The reference checks compare recorded requests and run
+both datasets through actual bubblewrap execution, generation, Judge evaluation,
+resume, restored SDK operations and deterministic planner fallback. The bubblewrap
+integration check requires the `bwrap` executable. The validation suite is kept
+outside this trimmed distribution.
 
 ## Run the Codes
 
@@ -84,6 +114,8 @@ MaC/
 │   ├── memory_extractor.py         # atomic-fact extraction
 │   ├── memory_builder.py           # canonical facts, deduplication, and fact graph
 │   ├── semantic_compiler.py        # executable memory, indexes, and state links
+│   ├── prompts.py                  # dataset-specific planner and answer prompts
+│   ├── benchmark.py                # dataset metadata and policy fingerprints
 │   ├── retrieval_pipeline.py       # code, lexical, graph, and context retrieval
 │   ├── program_executor.py         # planner, validator, and sandbox execution
 │   ├── qa_engine.py                # evidence-grounded answer generation

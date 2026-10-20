@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+from . import benchmark
+
 import httpx
 from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError
 
@@ -675,7 +677,7 @@ class OpenAIJudgeClient:
         )
 
 
-def extract_json(text: str) -> str:
+def _longmem_extract_json(text: str) -> str:
     """Return the complete top-level JSON value embedded in an LLM response.
 
     Fact extraction is allowed to return a list of facts.  Do not strip an
@@ -709,7 +711,7 @@ def extract_json(text: str) -> str:
     return text
 
 
-def parse_json_response(text: str) -> Any:
+def _longmem_parse_json_response(text: str) -> Any:
     """Parse an LLM JSON response, repairing one known field-quote defect.
 
     Some Qwen responses are valid except for a line such as
@@ -740,3 +742,46 @@ def parse_json_response(text: str) -> Any:
                     except json.JSONDecodeError:
                         pass
         raise original_error
+
+
+def _locomo_extract_json(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _locomo_parse_json_response(text: str) -> dict:
+    """Parse an LLM JSON response, repairing one known field-quote defect.
+
+    Some model responses are valid except for a line such as
+    ``session_id": "..."`` where the opening quote of the object key is
+    missing.  The repair is intentionally restricted to line-leading object
+    keys and runs only after ordinary JSON parsing has failed.
+    """
+    payload = extract_json(text)
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as original_error:
+        repaired = re.sub(
+            r'(?m)^(\s*)([A-Za-z_][A-Za-z0-9_]*)"\s*:',
+            r'\1"\2":',
+            payload,
+        )
+        if repaired == payload:
+            raise original_error
+        return json.loads(repaired)
+
+
+def extract_json(text: str) -> str:
+    return _locomo_extract_json(text) if benchmark.is_locomo() else _longmem_extract_json(text)
+
+
+def parse_json_response(text: str) -> Any:
+    return _locomo_parse_json_response(text) if benchmark.is_locomo() else _longmem_parse_json_response(text)

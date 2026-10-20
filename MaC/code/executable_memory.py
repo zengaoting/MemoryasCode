@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
-from .memory_runtime import Evidence, evidence_from_function, merge_evidence
+from .memory_runtime import Evidence, evidence_from_function, latest, merge_evidence
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -44,6 +44,12 @@ def _program_selected(item: Evidence) -> Evidence:
         if fact_id and fact_id not in selected:
             selected.append(fact_id)
     return replace(item, metadata={**item.metadata, "program_selected_fact_ids": selected})
+
+
+def _without_program_selection(item: Evidence) -> Evidence:
+    metadata = dict(item.metadata)
+    metadata.pop("program_selected_fact_ids", None)
+    return replace(item, metadata=metadata)
 
 
 def _as_date(value: Any) -> tuple[int, int, int, str]:
@@ -290,6 +296,9 @@ class MemorySDK:
 
     # ----- Generic programmatic-search APIs -----
 
+    def materialize(self, fact_ids: list[str] | tuple[str, ...]) -> list[Evidence]:
+        return [_program_selected(item) for item in self._call_facts(fact_ids)]
+
     def _call_facts(self, fact_ids: list[str] | tuple[str, ...]) -> list[Evidence]:
         output = []
         for fact_id in fact_ids:
@@ -328,7 +337,7 @@ class MemorySDK:
 
     def search(self, query: str, limit: int = 24) -> list[Evidence]:
         records = self._rank_records(query, list(self._facts_by_id.values()), limit)
-        return self._call_facts([str(item.get("fact_id", "")) for item in records])
+        return self.materialize([str(item.get("fact_id", "")) for item in records])
 
     def select(
         self,
@@ -382,7 +391,7 @@ class MemorySDK:
         candidates.sort(key=lambda item: (_as_date(item.get("normalized_time")), str(item.get("fact_id", ""))))
         if not complete:
             candidates = candidates[: max(0, int(limit))]
-        return self._call_facts([str(item.get("fact_id", "")) for item in candidates])
+        return self.materialize([str(item.get("fact_id", "")) for item in candidates])
 
     def _source_lines(self, fact_ids: list[str], window: int = 2) -> list[str]:
         wanted: list[tuple[int, int]] = []
@@ -454,7 +463,18 @@ class MemorySDK:
             if neighbor and neighbor not in seeds and neighbor not in targets:
                 targets.append(neighbor)
         ranked = self._rank_records(str(self.retrieval_bundle.get("question", "")), [self._facts_by_id[item] for item in targets if item in self._facts_by_id], 96)
-        return self._call_facts([str(item.get("fact_id", "")) for item in ranked])
+        return self.materialize([str(item.get("fact_id", "")) for item in ranked])
+
+    def join(self, left: Evidence | list[Evidence], right: Evidence | list[Evidence], on: str = "subject") -> Evidence:
+        matches, merged = [], []
+        for first in _flatten(left):
+            for second in _flatten(right):
+                first_value = first.metadata.get(on, getattr(first.value, on, None))
+                second_value = second.metadata.get(on, getattr(second.value, on, None))
+                if first_value is not None and first_value == second_value:
+                    matches.append({"left": first.value, "right": second.value, on: first_value})
+                    merged.extend([first, second])
+        return merge_evidence(merged, value=matches, rule=f"join_on_{on}")
 
     def aggregate(self, evidence: Evidence | list[Evidence], operation: str = "count") -> Evidence:
         values = _flatten(evidence)
@@ -476,6 +496,33 @@ class MemorySDK:
             "fact_ids": [fact_id for item in values for fact_id in item.fact_ids],
             "unresolved_state": unresolved,
         }
+
+    def fetch(self, evidence: Evidence | list[Evidence]) -> Evidence:
+        wanted = {dialogue_id for item in _flatten(evidence) for dialogue_id in item.dialogue_ids}
+        lines = []
+        for session in self.source_dialogue.get("conversation", {}).values():
+            if not isinstance(session, list):
+                continue
+            for turn in session:
+                if isinstance(turn, dict) and str(turn.get("dia_id", "")) in wanted:
+                    lines.append({"dia_id": turn.get("dia_id", ""), "speaker": turn.get("speaker", ""), "text": turn.get("text", "")})
+        values = _flatten(evidence)
+        return merge_evidence(values, value={"facts": [item.to_dict() for item in values], "source_lines": lines}, rule="fetch_source")
+
+    def current(self, subject: str, predicate: str, as_of: str | None = None) -> Evidence:
+        functions = []
+        for record in self.function_index:
+            if not _is_base_fact(record) or not record.get("stateful"):
+                continue
+            if _normalise(record.get("subject")) == _normalise(subject) and _normalise(record.get("predicate")) == _normalise(predicate):
+                module, _, name = str(record.get("entrypoint", "")).partition(":")
+                function = getattr(self._load_generated_module(module), name, None)
+                if callable(function):
+                    functions.append(function)
+        return latest(*functions, as_of=as_of)
+
+    def history(self, subject: str, predicate: str, as_of: str | None = None) -> Evidence:
+        return merge_evidence(self.select(subject=subject, predicate=predicate, end=as_of, complete=True), rule="complete_structured_history")
 
     # ----- Code loading and indexing internals -----
 
