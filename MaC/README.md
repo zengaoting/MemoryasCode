@@ -17,117 +17,30 @@ The framework is illustrated below.
   <em>Figure 1: The overall framework of MaC, consisting of Codified Construction and Declarative Retrieval.</em>
 </p>
 
-The design provides reusable memory computations, complete one-plan retrieval instead of repeated stepwise planning, and per-question execution traces containing generated programs, validation outcomes, repair attempts, fact IDs, and source references.
-
-### Dataset-specific MaC2 reference behavior
-
-This revision restores the active policies from two saved reference projects:
-
-- LoCoMo: `/home/yuxin/MaC/locomo/deepseek/MaC2`.
-- LongMemEval: `/home/yuxin/MaC/lm/qwen/MaC2`.
-
-LoCoMo uses its benchmark category to choose planner guidance and a recommended
-retrieval skeleton. Multi-hop and open-domain questions recommend concept/session
-expansion; temporal questions recommend session expansion; single-hop questions
-recommend the direct code/lexical union without scope expansion. These are
-recommendations, not mandatory program steps. The deterministic fallback uses
-the same category-specific skeleton after exhausted planning/repair attempts.
-
-LongMemEval uses the reference SDK call card and common recommended skeleton,
-plus guidance for its six categories and the question date. Both datasets retain
-the reference category-specific answer instructions and audit triggers. Category
-labels are intentional model inputs in this revision. Gold answers and annotated
-gold evidence remain outside generation and are used for evaluation only.
-
-Dataset-specific planning and answer prompts live in `code/prompts.py`.
-`code/program_executor.py` selects planner guidance and retrieval skeletons;
-`code/qa_engine.py` applies answer instructions, repairs, and audits. Dataset
-selection, category normalization, and policy fingerprints live in
-`code/benchmark.py`. The reference projects are listed above; the integrated
-runtime does not depend on them. Shared semantic compiler prompts remain in
-`code/prompt_contracts.py`. The Markdown files in
-`prompts/` document the runtime prompts; editing Markdown does not alter execution.
-The Judge wording also matches the reference evaluators rather than the previous
-label-only rewrite.
-
-The defaults below match the non-secret settings in the reference projects'
-`.env` files, including their launcher settings:
-
-| Parameter | LoCoMo | LongMemEval |
-| --- | ---: | ---: |
-| Memory extraction / semantic workers | 4 / 4 | 4 / 4 |
-| Session extraction workers per sample | 2 | 2 |
-| QA / Judge workers | 4 / 12 | 4 / 12 |
-| Global concurrent API requests | 4 | 4 |
-| Maximum extracted facts per session | 64 | 64 |
-| Semantic batch size | 40 | 80 |
-| Semantic request timeout / API attempts | 900 s / 3 | 300 s / 1 |
-| DeepSeek or Qwen request timeout / API attempts | 900 s / 3 | 900 s / 3 |
-| Cross-Encoder batch size / max length | 8 / 512 | 8 / 512 |
-| Code recall / lexical prefilter | 24 / 320 | 24 / 320 (768 for high coverage) |
-| Scope expansion / expansion prefilter | 32 / 96 | 12 / 96 |
-| Keyword recall / source window | 32 / 2 | 32 / 2 |
-| Sandbox wall / CPU / memory limit | 5 s / 5 s / 512 MiB | 5 s / 5 s / 512 MiB |
-
-The reranker is `Qwen/Qwen3-Reranker-0.6B`, loaded from local files by default.
-CUDA defaults to GPU 0, expandable allocation segments are enabled, and tokenizer
-parallelism is disabled. Existing process or `.env` settings take precedence over
-these defaults. `MAC_*` worker settings take precedence over equivalent reference
-`OUR_V1_*` settings; explicit CLI worker arguments take precedence over both.
-`MAC_SEMANTIC_BATCH_SIZE` explicitly overrides the dataset batch size. In
-particular, DeepSeek no longer silently changes LongMemEval's batch size to 40.
-Model names and credentials remain provider configuration, independent of the
-benchmark strategy. An explicitly configured model is not changed by migration.
-
-The newer staged construction pools, per-batch resume checkpoints, atomic writes,
-and bounded generated filenames are retained. QA checkpoint version 33, planner
-version 12, build version 15, and reference-policy fingerprints prevent old
-category-free generated artifacts from being silently reused. Use a new output
-directory for a new experiment; historical result files are not migrated.
-
-Moving the dataset policies into these existing modules preserves the prompt
-text and runtime parameters. The integrated policy fingerprint covers the prompt,
-planner, answer, and dataset modules, so QA/planner checkpoints created before
-this reorganization are invalidated. Compatible memory-construction caches can
-still be reused.
-
-`run_config.json` records the effective worker counts, runtime parameters,
-semantic batch size, dataset, model and policy digest without credentials.
-Reference code/behavior alignment does not imply that a fresh API run will
-reproduce historical scores or the five-round Judge mean and standard deviation.
-
-Offline validation uses fixed model responses, with no API calls or model
-downloads. The reference checks compare recorded requests and run
-both datasets through actual bubblewrap execution, generation, Judge evaluation,
-resume, restored SDK operations and deterministic planner fallback. The bubblewrap
-integration check requires the `bwrap` executable. The validation suite is kept
-outside this trimmed distribution.
-
 ## Run the Codes
 
 ### Repo Introduction
 
 ```text
 MaC/
-├── code/                           # MaC implementation
-│   ├── main.py                     # CLI entry point and pipeline orchestration
-│   ├── memory_extractor.py         # atomic-fact extraction
-│   ├── memory_builder.py           # canonical facts, deduplication, and fact graph
-│   ├── semantic_compiler.py        # executable memory, indexes, and state links
-│   ├── prompts.py                  # dataset-specific planner and answer prompts
-│   ├── benchmark.py                # dataset metadata and policy fingerprints
-│   ├── retrieval_pipeline.py       # code, lexical, graph, and context retrieval
-│   ├── program_executor.py         # planner, validator, and sandbox execution
-│   ├── qa_engine.py                # evidence-grounded answer generation
-│   ├── evaluator.py                # F1 and binary LLM-Judge evaluation
-│   └── llm_client.py               # Qwen, DeepSeek, and official OpenAI adapters
+├── code/                           
+│   ├── main.py                     
+│   ├── memory_extractor.py         
+│   ├── memory_builder.py           
+│   ├── semantic_compiler.py        
+│   ├── prompts.py                  
+│   ├── benchmark.py                
+│   ├── retrieval_pipeline.py       
+│   ├── program_executor.py         
+│   ├── qa_engine.py                
+│   ├── evaluator.py                
+│   └── llm_client.py               
 ├── data/
-│   ├── locomo10.json               # LoCoMo input
-│   └── dataset_LM.json             # LongMemEval input
-├── assets/framework.png            # framework figure
-├── prompts/                        # two paper-appendix prompt references
-├── .env.example                    # API credential template
-├── requirements.txt                # Python dependencies
+│   ├── locomo10.json               
+│   └── dataset_LM.json             
+├── prompts/                       
+├── .env.example                   
+├── requirements.txt                
 └── README.md                       # this file
 ```
 
